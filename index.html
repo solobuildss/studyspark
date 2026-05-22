@@ -398,7 +398,7 @@
     // Email allowlist - ONLY these emails can sign in.
     // Add yours (lowercase) and any family/team members you want to grant access.
     allowedEmails: [
-      'your-email@gmail.com',
+      'sawandobariya.uk@gmail.com',
     ],
   };
   // ===============================================================
@@ -601,25 +601,41 @@
       }, 'studyspark_main');
       const fbAuth = auth.getAuth(fbApp);
       const fbDb = fs.getFirestore(fbApp);
-      // Set local persistence so user stays logged in across refreshes
       try { await auth.setPersistence(fbAuth, auth.browserLocalPersistence); } catch(e){ /* ignore */ }
-      // Save partial fb object for sign-in modal to use
       fb = { app: fbApp, auth: fbAuth, db: fbDb, fs, listeners: [], suppressNext: false, user: null, googleUser: null };
 
-      // Listen for auth state changes (covers redirect-back too)
+      // Handle redirect result if we just came back from a sign-in redirect
+      try {
+        const redirectResult = await auth.getRedirectResult(fbAuth);
+        if(redirectResult && redirectResult.user){
+          console.log('Returned from sign-in redirect, user:', redirectResult.user.email);
+        }
+      } catch(redirErr){
+        console.warn('Redirect result error:', redirErr);
+        if(redirErr.code === 'auth/unauthorized-domain'){
+          state.syncError = `Domain "${location.hostname}" not authorized in Firebase. Add it in Firebase Console → Authentication → Settings → Authorized domains.`;
+          state.syncStatus = 'error';
+          render();
+          return;
+        }
+      }
+
+      // Listen for auth state changes
       auth.onAuthStateChanged(fbAuth, async (user) => {
         if(user && user.email){
           // Check allowlist
           const allowed = EMBEDDED_CONFIG.allowedEmails.map(e => e.trim().toLowerCase());
           if(!allowed.includes(user.email.toLowerCase())){
             state.syncStatus = 'unauthorized';
-            state.syncError = `${user.email} is not authorized to use this app.`;
+            state.syncError = `${user.email} is not authorized to use this app. Only allowlisted accounts can sign in.`;
             await auth.signOut(fbAuth);
             fb.user = null; fb.googleUser = null;
+            state.googleUser = null;
+            state.signInPending = false;
             render();
             return;
           }
-          // Authorized - set up
+          // Authorized
           fb.user = user;
           fb.googleUser = {
             uid: user.uid,
@@ -629,24 +645,24 @@
           };
           state.googleUser = fb.googleUser;
           state.signInPending = false;
+          state.syncError = '';
 
-          // Try to fetch saved Gemini API key from Firestore
           await loadGeminiKeyFromCloud();
-
-          // Begin sync
           await beginSyncForGoogleUser();
         } else {
-          // Signed out
           fb.user = null; fb.googleUser = null;
           state.googleUser = null;
-          state.syncStatus = 'signin-needed';
+          state.signInPending = false;
+          if(state.syncStatus !== 'error' && state.syncStatus !== 'unauthorized'){
+            state.syncStatus = 'signin-needed';
+          }
           render();
         }
       });
     } catch(e){
-      console.error(e);
+      console.error('initGoogleAuth error:', e);
       state.syncStatus = 'error';
-      state.syncError = e.message || 'Failed to initialize';
+      state.syncError = e.message || 'Failed to initialize Firebase. Check your EMBEDDED_CONFIG values.';
       render();
     }
   }
@@ -654,33 +670,95 @@
   async function signInWithGoogle(){
     if(!fb || !fb.auth){
       await initGoogleAuth();
-      // Wait briefly for fb to be ready
-      await new Promise(r => setTimeout(r, 200));
+      await new Promise(r => setTimeout(r, 300));
     }
-    if(!fb || !fb.auth){ toast('❌ Auth not initialized'); return; }
+    if(!fb || !fb.auth){
+      state.syncError = 'Firebase not initialized. Check the EMBEDDED_CONFIG values in the HTML file.';
+      state.syncStatus = 'error';
+      state.signInPending = false;
+      render();
+      return;
+    }
     const { auth } = await loadFirebase();
     const provider = new auth.GoogleAuthProvider();
     provider.setCustomParameters({ prompt: 'select_account' });
     state.signInPending = true;
+    state.syncError = '';
     render();
-    try {
-      await auth.signInWithPopup(fb.auth, provider);
-      // onAuthStateChanged handles the rest
-    } catch(e){
-      state.signInPending = false;
-      console.error(e);
-      if(e.code === 'auth/popup-closed-by-user' || e.code === 'auth/cancelled-popup-request'){
-        // user dismissed, no toast
-      } else if(e.code === 'auth/popup-blocked' || e.code === 'auth/unauthorized-domain'){
-        // Fallback to redirect (popup blocked, mobile, etc.)
-        try {
-          await auth.signInWithRedirect(fb.auth, provider);
-        } catch(e2){
-          toast('❌ ' + (e2.message || 'Sign-in failed'));
-        }
-      } else {
-        toast('❌ ' + (e.message || 'Sign-in failed'));
+
+    // Watchdog: if nothing happens within 30s, clear pending state
+    const watchdog = setTimeout(() => {
+      if(state.signInPending){
+        state.signInPending = false;
+        state.syncError = 'Sign-in is taking too long. The popup may have been blocked. Try again or check your browser\'s popup settings.';
+        state.syncStatus = 'signin-needed';
+        render();
       }
+    }, 30000);
+
+    try {
+      const result = await auth.signInWithPopup(fb.auth, provider);
+      clearTimeout(watchdog);
+      // Success path: onAuthStateChanged will handle the rest, but in case it doesn't, clear here too
+      if(!result || !result.user){
+        state.signInPending = false;
+        state.syncError = 'Sign-in completed but no user info returned. Try again.';
+        render();
+      }
+      // Don't clear signInPending here - onAuthStateChanged sets the user and status
+    } catch(e){
+      clearTimeout(watchdog);
+      state.signInPending = false;
+      console.error('Sign-in error:', e);
+      const code = e.code || '';
+
+      if(code === 'auth/popup-closed-by-user' || code === 'auth/cancelled-popup-request' || code === 'auth/user-cancelled'){
+        state.syncError = '';
+        render();
+        return;
+      }
+      if(code === 'auth/unauthorized-domain'){
+        state.syncError = `This domain isn't authorized in Firebase. In Firebase Console: Authentication → Settings → Authorized domains → Add "${location.hostname}"`;
+        state.syncStatus = 'error';
+        render();
+        return;
+      }
+      if(code === 'auth/operation-not-allowed' || code === 'auth/configuration-not-found'){
+        state.syncError = 'Google sign-in is not enabled in your Firebase project. Go to Firebase Console → Authentication → Sign-in method → Google → Enable.';
+        state.syncStatus = 'error';
+        render();
+        return;
+      }
+      if(code === 'auth/api-key-not-valid' || code === 'auth/invalid-api-key'){
+        state.syncError = 'Invalid Firebase API key. Check the EMBEDDED_CONFIG.apiKey value in your HTML file matches your Firebase project.';
+        state.syncStatus = 'error';
+        render();
+        return;
+      }
+      if(code === 'auth/popup-blocked'){
+        // Try redirect fallback
+        try {
+          state.syncError = 'Popup blocked, redirecting to Google...';
+          render();
+          await auth.signInWithRedirect(fb.auth, provider);
+          // Page redirects away; nothing else to do
+        } catch(e2){
+          state.syncError = '❌ Popup blocked and redirect failed: ' + (e2.message || 'unknown');
+          state.syncStatus = 'error';
+          render();
+        }
+        return;
+      }
+      if(code === 'auth/network-request-failed'){
+        state.syncError = 'Network error. Check your internet connection and try again.';
+        state.syncStatus = 'error';
+        render();
+        return;
+      }
+
+      // Generic fallback
+      state.syncError = `Sign-in failed: ${e.message || code || 'unknown error'}. Check browser console for details.`;
+      state.syncStatus = 'error';
       render();
     }
   }
@@ -2639,9 +2717,10 @@ service cloud.firestore {
   function renderSignInScreen(){
     const isUnauthorized = state.syncStatus === 'unauthorized';
     const isError = state.syncStatus === 'error';
+    const isPending = state.signInPending;
     return `
       <div style="display:flex;align-items:center;justify-content:center;min-height:100vh;width:100%;padding:20px;position:relative;z-index:1">
-        <div style="background:#fff;border:3px solid var(--ink);border-radius:24px;box-shadow:10px 10px 0 var(--ink);padding:40px 32px;max-width:440px;width:100%;text-align:center">
+        <div style="background:#fff;border:3px solid var(--ink);border-radius:24px;box-shadow:10px 10px 0 var(--ink);padding:40px 32px;max-width:480px;width:100%;text-align:center">
           <div style="font-family:'Fraunces',serif;font-weight:900;font-size:42px;color:var(--ink);letter-spacing:-0.03em;margin-bottom:8px;display:flex;align-items:center;justify-content:center;gap:10px">
             <span style="display:inline-block;width:18px;height:18px;border-radius:50%;background:var(--pink);box-shadow:4px 4px 0 var(--sun);transform:translateY(-6px)"></span>
             StudySpark
@@ -2649,29 +2728,35 @@ service cloud.firestore {
           <p style="color:rgba(26,21,48,.65);font-weight:500;margin-bottom:28px;font-size:15px">Your AI study notebooks, synced across devices</p>
 
           ${isUnauthorized ? `
-            <div style="padding:14px;background:#ffe5e5;border:2px solid var(--pink);border-radius:12px;margin-bottom:18px;font-size:14px;font-weight:500;color:#a3104a">
+            <div style="padding:14px;background:#ffe5e5;border:2px solid var(--pink);border-radius:12px;margin-bottom:18px;font-size:13px;font-weight:500;color:#a3104a;text-align:left">
               🚫 ${state.syncError || 'This account is not authorized.'}
             </div>
           ` : ''}
-          ${isError ? `
-            <div style="padding:14px;background:#fff8ec;border:2px solid var(--ink);border-radius:12px;margin-bottom:18px;font-size:13px;font-weight:500">
-              ⚠️ ${state.syncError || 'Could not connect to Firebase. Check that the embedded config is correct.'}
+          ${isError && state.syncError ? `
+            <div style="padding:14px;background:#fff8ec;border:2px solid var(--ink);border-radius:12px;margin-bottom:18px;font-size:13px;font-weight:500;text-align:left;line-height:1.5">
+              ⚠️ ${state.syncError}
             </div>
           ` : ''}
 
-          <button data-action="sign-in-google" style="width:100%;padding:14px 20px;border:3px solid var(--ink);border-radius:14px;background:#fff;font-weight:700;font-size:16px;cursor:pointer;box-shadow:3px 3px 0 var(--ink);display:flex;align-items:center;justify-content:center;gap:10px;font-family:inherit;transition:all .12s" ${state.signInPending?'disabled':''}>
-            <svg width="20" height="20" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
-              <path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" fill="#4285F4"/>
-              <path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#34A853"/>
-              <path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" fill="#FBBC05"/>
-              <path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#EA4335"/>
-            </svg>
-            ${state.signInPending ? 'Signing in…' : 'Sign in with Google'}
+          <button data-action="sign-in-google" style="width:100%;padding:14px 20px;border:3px solid var(--ink);border-radius:14px;background:#fff;font-weight:700;font-size:16px;cursor:${isPending?'wait':'pointer'};box-shadow:3px 3px 0 var(--ink);display:flex;align-items:center;justify-content:center;gap:10px;font-family:inherit;transition:all .12s;${isPending?'opacity:.7':''}" ${isPending?'disabled':''}>
+            ${isPending ? `<div style="width:18px;height:18px;border:3px solid var(--ink);border-top-color:transparent;border-radius:50%;animation:spin 1s linear infinite"></div>` : `
+              <svg width="20" height="20" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                <path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" fill="#4285F4"/>
+                <path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#34A853"/>
+                <path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" fill="#FBBC05"/>
+                <path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#EA4335"/>
+              </svg>
+            `}
+            ${isPending ? 'Signing in…' : 'Sign in with Google'}
           </button>
+
+          ${isPending ? `
+            <button data-action="cancel-signin" style="background:none;border:none;color:rgba(26,21,48,.55);font-size:12px;margin-top:12px;cursor:pointer;text-decoration:underline;font-family:inherit">Cancel and try again</button>
+          ` : ''}
 
           <p style="font-size:12px;color:rgba(26,21,48,.5);margin-top:18px;line-height:1.5">
             Only authorized accounts can access this app.<br>
-            Your data syncs across all your devices automatically.
+            ${isError ? '<strong style="color:var(--ink)">Check browser console (F12) for details.</strong>' : 'Your data syncs across all your devices automatically.'}
           </p>
         </div>
       </div>`;
@@ -2815,6 +2900,12 @@ service cloud.firestore {
       }
       case 'sign-in-google':
         signInWithGoogle();
+        break;
+      case 'cancel-signin':
+        state.signInPending = false;
+        state.syncStatus = 'signin-needed';
+        state.syncError = '';
+        render();
         break;
       case 'sign-out-google':
         if(confirm('Sign out? Your local data stays, but sync will stop.')){
