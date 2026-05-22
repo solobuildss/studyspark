@@ -307,64 +307,201 @@
     .chat-messages{min-height:340px}
   }
   @media (max-width: 700px){
-    .sidebar{width:64px;padding:14px 6px;gap:4px}
-    .sidebar .logo{font-size:0;margin-bottom:14px}
+    /* Mobile uses drawer + bottom nav, not sidebar */
+    .app{flex-direction:column}
+    .sidebar{
+      position:fixed;
+      top:0;left:0;bottom:0;
+      width:280px;
+      height:100vh;
+      z-index:100;
+      transform:translateX(-100%);
+      transition:transform .25s ease;
+      padding:max(env(safe-area-inset-top),20px) 20px 20px;
+      gap:8px;
+      border-right:3px solid var(--ink);
+      box-shadow:8px 0 0 rgba(0,0,0,.15);
+      overflow-y:auto;
+    }
+    .sidebar.mobile-open{transform:translateX(0)}
+    .sidebar .logo{font-size:24px;margin-bottom:20px;display:flex;align-items:center;gap:10px}
     .sidebar .logo .dot{margin:0}
-    .nav-item span:not(.nav-icon){display:none}
-    .nav-item{justify-content:center;padding:10px}
-    .api-status{padding:8px}
-    .api-status .label{font-size:9px}
-    .api-status .value{font-size:11px}
-    .api-status .btn{padding:5px 6px !important;font-size:10px !important}
-    .main{padding:18px 14px 60px}
-    .page-title{font-size:28px;line-height:1.1}
-    .page-sub{font-size:13px;margin-bottom:18px}
-    .stat-grid{gap:10px}
+    .nav-item{justify-content:flex-start;padding:12px 14px;font-size:14px;width:100%}
+    .nav-item span:not(.nav-icon){display:inline;font-size:14px}
+    .nav-icon{font-size:18px}
+
+    /* Mobile drawer backdrop */
+    .sidebar-backdrop{
+      display:none;
+      position:fixed;
+      inset:0;
+      background:rgba(0,0,0,.4);
+      z-index:99;
+    }
+    .sidebar-backdrop.active{display:block}
+
+    /* Mobile top bar */
+    .mobile-topbar{
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      padding:max(env(safe-area-inset-top),12px) 14px 10px;
+      background:var(--bg);
+      position:sticky;
+      top:0;
+      z-index:50;
+      border-bottom:2px solid rgba(26,21,48,.08);
+    }
+    .mobile-topbar .brand{
+      display:flex;align-items:center;gap:8px;
+      font-family:'Fraunces',serif;font-size:20px;font-weight:900;color:var(--ink);
+    }
+    .mobile-topbar .brand .dot-wrap{position:relative;width:18px;height:18px}
+    .mobile-topbar .brand .dot-wrap::before{
+      content:'';position:absolute;width:14px;height:14px;border-radius:50%;
+      background:var(--sun);top:4px;left:4px;border:2px solid var(--ink);
+    }
+    .mobile-topbar .brand .dot-wrap::after{
+      content:'';position:absolute;width:14px;height:14px;border-radius:50%;
+      background:var(--pink);top:0;left:0;border:2px solid var(--ink);
+    }
+    .hamburger{
+      background:#fff;
+      border:3px solid var(--ink);
+      border-radius:10px;
+      padding:8px 10px;
+      cursor:pointer;
+      box-shadow:2px 2px 0 var(--ink);
+      font-size:18px;
+      line-height:1;
+    }
+    .api-status{padding:10px;border-radius:10px}
+    .api-status .label{font-size:10px}
+    .api-status .value{font-size:12px}
+
+    .main{
+      padding:14px 14px calc(110px + env(safe-area-inset-bottom));
+      width:100%;
+      flex:1;
+      min-width:0;
+    }
+    .page-title{font-size:26px;line-height:1.1;margin-bottom:6px}
+    .page-sub{font-size:13px;margin-bottom:16px}
+
+    /* Stats: 2x2 grid */
+    .stat-grid{gap:10px;grid-template-columns:repeat(2,1fr)}
     .stat{padding:14px}
     .stat .num{font-size:28px}
     .stat .lbl{font-size:11px}
-    .stat .decoration{font-size:40px}
-    .nb-grid{gap:12px;grid-template-columns:1fr 1fr}
-    .nb-card{padding:14px}
-    .nb-card h3{font-size:16px}
-    .nb-card .emoji{font-size:28px}
+    .stat .decoration{font-size:38px}
+
+    /* Notebook cards: single column on small phones */
+    .nb-grid{gap:12px;grid-template-columns:1fr}
+    .nb-card{padding:16px}
+    .nb-card h3{font-size:18px}
+    .nb-card .emoji{font-size:30px}
     .nb-card .meta{font-size:11px}
+
     .card{padding:16px;border-radius:16px}
-    .modal{padding:22px;border-radius:18px}
+    .modal{padding:22px;border-radius:18px;max-height:90vh;overflow-y:auto}
     .modal h2{font-size:22px}
-    .quiz-question{padding:22px;border-radius:18px}
-    .q-text{font-size:20px}
-    .q-option{padding:14px;font-size:14px}
-    .q-option .letter{width:28px;height:28px;font-size:13px}
+
+    /* Quiz */
+    .quiz-question{padding:20px;border-radius:18px}
+    .q-text{font-size:18px;line-height:1.25}
+    .q-num{font-size:11px}
+    .q-option{padding:13px;font-size:14px}
+    .q-option .letter{width:28px;height:28px;font-size:13px;flex-shrink:0}
+    .quiz-progress .count{font-size:11px}
+    .quiz-progress .bar{height:10px}
+    .quiz-actions{display:flex;gap:8px;flex-wrap:wrap}
+    .quiz-actions .btn{padding:10px 14px;font-size:13px;flex:1;min-width:0}
+
+    /* Flashcards */
     .flashcard{height:280px}
     .flashcard-face .content{font-size:18px}
     .flashcard-face{padding:24px}
-    .nb-grid{grid-template-columns:1fr}
+
+    /* Source items */
     .source-item{padding:10px;font-size:12px}
     .source-item .src-ico{font-size:18px}
+    .src-title{font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+    /* Messages */
     .msg{max-width:94%;padding:11px 14px;font-size:14px}
     .chat-input{font-size:14px;padding:10px 12px;min-height:42px}
-    .toast{left:14px;right:14px;bottom:14px;max-width:none;font-size:13px;padding:11px 14px}
+    .toast{left:14px;right:14px;bottom:80px;max-width:none;font-size:13px;padding:11px 14px}
+
+    /* Studio tiles */
     .studio-tile{padding:11px}
     .studio-tile .st-ico{font-size:22px}
     .studio-tile .st-title{font-size:13px}
     .studio-tile .st-desc{font-size:10px}
+
     .section-title{font-size:22px;margin:22px 0 12px}
     .btn{font-size:13px;padding:10px 14px}
-    .cite-popup{padding:16px;border-radius:14px}
+    .btn-sm{padding:8px 12px;font-size:12px}
+
+    .cite-popup{padding:16px;border-radius:14px;max-height:88vh;overflow-y:auto}
     .cite-popup .passage{font-size:13px;padding:11px}
+
     .upload-zone{padding:24px 16px;font-size:13px}
     .upload-zone .ico{font-size:32px}
-    .quiz-progress .count{font-size:11px}
-    .quiz-progress .bar{height:10px}
-    .quiz-actions .btn{padding:10px 14px;font-size:13px}
-    .score-circle{width:180px;height:180px}
-    .score-num{font-size:56px}
-    .mind-central{font-size:18px;padding:14px 22px}
-    .mind-branch{min-width:0;width:100%;max-width:100%;padding:14px}
-    .mind-branch h4{font-size:16px}
-    .mindmap-wrap{padding:18px}
+
+    .score-circle{width:160px;height:160px}
+    .score-num{font-size:48px}
+    .mind-central{font-size:16px;padding:12px 20px}
+    .mindmap-wrap{padding:14px}
     .nb-layout{gap:10px}
+
+    /* Number pick chips for quiz setup */
+    .number-pick{display:grid;grid-template-columns:repeat(5,1fr);gap:6px}
+    .number-pick .chip{padding:8px 4px !important;font-size:13px !important;min-width:0}
+
+    .chip-row{display:flex;flex-wrap:wrap;gap:6px}
+    .chip-row .chip{flex:1;min-width:0;padding:8px 10px !important;font-size:12px !important;white-space:nowrap}
+
+    /* Quiz setup grid: stack to single column */
+    .quiz-setup-grid{grid-template-columns:1fr !important;gap:14px !important}
+
+    /* Question type buttons - horizontal row instead of column */
+    .question-types-row{display:grid !important;grid-template-columns:repeat(3,1fr) !important;gap:8px !important}
+    .question-types-row .chip{padding:14px 6px !important;font-size:12px !important;white-space:normal !important;line-height:1.2;text-align:center;border-radius:14px !important}
+
+    /* Chip-style chapter chips: text-ellipsis */
+    .chapter-chip{max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .chapter-chip .ch-title{display:none !important}
+    .chapter-chip .ch-title{display:inline}
+
+    /* Bottom nav */
+    .mobile-bottom-nav{
+      display:flex;
+      position:fixed;
+      bottom:0;left:0;right:0;
+      background:var(--ink);
+      border-top:3px solid var(--ink);
+      padding:8px 8px max(env(safe-area-inset-bottom),8px);
+      z-index:50;
+      justify-content:space-around;
+    }
+    .mobile-bottom-nav button{
+      background:none;border:none;color:#fff8ec;
+      display:flex;flex-direction:column;align-items:center;gap:2px;
+      padding:6px 8px;
+      cursor:pointer;
+      font-family:inherit;
+      font-size:10px;
+      font-weight:600;
+      flex:1;
+      transition:transform .15s;
+    }
+    .mobile-bottom-nav button .ico{font-size:20px}
+    .mobile-bottom-nav button.active{color:var(--sun)}
+    .mobile-bottom-nav button:active{transform:scale(0.92)}
+  }
+  /* Hide mobile elements on desktop */
+  @media (min-width: 701px){
+    .mobile-topbar, .mobile-bottom-nav, .sidebar-backdrop{display:none !important}
   }
 </style>
 </head>
@@ -1834,7 +1971,7 @@ Return ONLY valid JSON. No markdown fences.`;
   }
 
   // ===== Sidebar =====
-  function renderSidebar(){
+  function renderSidebar(extraClass = ''){
     const items = [
       ['home','🏠','Home'],
       ['notebooks','📚','Notebooks'],
@@ -1842,7 +1979,7 @@ Return ONLY valid JSON. No markdown fences.`;
     ];
     const hasKey = !!state.apiKey;
     return `
-      <aside class="sidebar">
+      <aside class="sidebar ${extraClass}">
         <div class="logo"><span class="dot"></span><span>StudySpark</span></div>
         ${items.map(([k,i,l]) => `
           <button class="nav-item ${state.page===k?'active':''}" data-nav="${k}">
@@ -2442,10 +2579,10 @@ Return ONLY valid JSON. No markdown fences.`;
       nb.sources.forEach(src => (src.chapters || []).forEach(ch => allChapters.push({ src, ch })));
       if(allChapters.length > 0){
         scopeBanner = `<div style="padding:14px 18px;background:#fff;border:3px dashed var(--ink);border-radius:14px;margin-bottom:20px">
-          <div style="font-size:13px;letter-spacing:.05em;color:var(--ink);opacity:.7;margin-bottom:8px;font-weight:700">📚 QUIZ SCOPE: ENTIRE NOTEBOOK · TAP A CHAPTER TO NARROW</div>
+          <div style="font-size:12px;letter-spacing:.05em;color:var(--ink);opacity:.7;margin-bottom:8px;font-weight:700;line-height:1.3">📚 QUIZ SCOPE: ENTIRE NOTEBOOK<br><span style="font-size:11px;opacity:.85">Tap a chapter to narrow</span></div>
           <div style="display:flex;flex-wrap:wrap;gap:5px;max-height:88px;overflow-y:auto">
             ${allChapters.slice(0, 30).map(({src, ch}) => `
-              <button class="chip" data-action="set-chapter" data-src="${src.id}" data-num="${ch.num}" style="padding:5px 11px;font-size:12px" title="${escapeHTML(ch.label)} (${src.name})">Ch ${ch.num}${ch.title ? ': ' + escapeHTML(ch.title.substring(0,28)) : ''}</button>
+              <button class="chip chapter-chip" data-action="set-chapter" data-src="${src.id}" data-num="${ch.num}" style="padding:5px 11px;font-size:12px" title="${escapeHTML(ch.label)} (${src.name})"><span class="ch-num">Ch ${ch.num}</span>${ch.title ? `<span class="ch-title">: ${escapeHTML(ch.title)}</span>` : ''}</button>
             `).join('')}
           </div>
         </div>`;
@@ -2459,7 +2596,7 @@ Return ONLY valid JSON. No markdown fences.`;
         <h1 class="page-title">Build your quiz 🎯</h1>
         <p class="page-sub">${state.chapterFilter ? 'Focused on a specific chapter.' : 'From all selected sources in this notebook.'}</p>
         ${scopeBanner}
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:24px">
+        <div class="quiz-setup-grid" style="display:grid;grid-template-columns:1fr 1fr;gap:24px">
           <div class="card" style="box-shadow:var(--shadow-sm)">
             <h3 style="font-size:22px;margin-bottom:16px">Number of questions</h3>
             <div class="number-pick">
@@ -2472,7 +2609,7 @@ Return ONLY valid JSON. No markdown fences.`;
           </div>
           <div class="card" style="box-shadow:var(--shadow-sm)">
             <h3 style="font-size:22px;margin-bottom:12px">Question types</h3>
-            <div class="chip-row">
+            <div class="chip-row question-types-row">
               ${[['mcq','📝 Multiple choice'],['tf','✅ True/False'],['short','✏️ Short answer']].map(([v,l]) => `<button class="chip chip-teal ${state.quizConfig.types.includes(v)?'active':''}" data-toggle="type" data-val="${v}">${l}</button>`).join('')}
             </div>
             <div class="field" style="margin-top:18px">
@@ -3220,9 +3357,66 @@ service cloud.firestore {
     else if(state.page === 'results') body = renderResultsPage();
     else body = renderHome();
 
-    root.innerHTML = renderSidebar() + body + renderModal() + renderStudioView() + renderCitePopup() +
+    // Wrap mobile-only chrome around the body
+    const isMobile = window.innerWidth <= 700;
+    const mobileTopbar = isMobile ? renderMobileTopbar() : '';
+    const mobileBottomNav = isMobile ? renderMobileBottomNav() : '';
+    const sidebarBackdrop = isMobile ? `<div class="sidebar-backdrop ${state.sidebarOpen?'active':''}" data-action="close-drawer"></div>` : '';
+    const sidebarClass = state.sidebarOpen ? 'mobile-open' : '';
+
+    // On mobile, body is wrapped in a column that includes topbar above and bottom nav below
+    const wrappedBody = isMobile
+      ? `<div style="display:flex;flex-direction:column;flex:1;min-width:0;width:100%">${mobileTopbar}${body}</div>`
+      : body;
+
+    root.innerHTML = sidebarBackdrop +
+      renderSidebar(sidebarClass) +
+      wrappedBody +
+      mobileBottomNav +
+      renderModal() + renderStudioView() + renderCitePopup() +
       (state.toast ? `<div class="toast">${state.toast}</div>` : '');
     attachHandlers();
+  }
+
+  function renderMobileTopbar(){
+    const nb = state.activeNotebook;
+    const titleText = state.page === 'notebook' && nb ? `${nb.emoji||'📚'} ${nb.title}` :
+                      state.page === 'notebooks' ? '📚 Notebooks' :
+                      state.page === 'results' ? '📊 Results' :
+                      state.page === 'quiz-setup' ? '🎯 Build quiz' :
+                      'StudySpark';
+    const showBrand = !state.page || state.page === 'home';
+    return `
+      <div class="mobile-topbar">
+        <button class="hamburger" data-action="open-drawer" aria-label="Menu">☰</button>
+        ${showBrand ? `
+          <div class="brand">
+            <span class="dot-wrap"></span>
+            <span>StudySpark</span>
+          </div>
+        ` : `<div style="font-family:'Fraunces',serif;font-size:17px;font-weight:800;color:var(--ink);max-width:60%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${titleText}</div>`}
+        <div style="width:42px"></div>
+      </div>
+    `;
+  }
+
+  function renderMobileBottomNav(){
+    const items = [
+      ['home', '🏠', 'Home'],
+      ['notebooks', '📚', 'Notebooks'],
+      ['results', '📊', 'Results'],
+    ];
+    const current = state.page || 'home';
+    return `
+      <nav class="mobile-bottom-nav">
+        ${items.map(([k, icon, label]) => `
+          <button data-nav="${k}" class="${current===k?'active':''}">
+            <span class="ico">${icon}</span>
+            <span>${label}</span>
+          </button>
+        `).join('')}
+      </nav>
+    `;
   }
 
   // ===== Handlers =====
@@ -3242,6 +3436,7 @@ service cloud.firestore {
         state.currentQuiz = null; state.quizState = null;
         state.currentFlashcards = null; state.flashState = null;
         state.currentMindmap = null; state.studioView = null;
+        state.sidebarOpen = false; // close mobile drawer
         render();
       };
     });
@@ -3596,6 +3791,10 @@ service cloud.firestore {
       }
       case 'close-cite':
         state.citePopup = null; render(); break;
+      case 'open-drawer':
+        state.sidebarOpen = true; render(); break;
+      case 'close-drawer':
+        state.sidebarOpen = false; render(); break;
       case 'cite-prev':
         state.citePopup.chunkIdx = Math.max(1, state.citePopup.chunkIdx - 1);
         render(); break;
@@ -3879,6 +4078,20 @@ service cloud.firestore {
 
   // Boot
   render();
+
+  // Re-render on resize so layout (mobile vs desktop) flips correctly
+  let resizeTimer;
+  let prevIsMobile = window.innerWidth <= 700;
+  window.addEventListener('resize', () => {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => {
+      const nowMobile = window.innerWidth <= 700;
+      if(nowMobile !== prevIsMobile){
+        prevIsMobile = nowMobile;
+        render();
+      }
+    }, 150);
+  });
 </script>
 </body>
 </html>
