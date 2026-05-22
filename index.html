@@ -1128,12 +1128,29 @@
   function isJunkChunk(text){
     const t = text.trim();
     if(t.length < 300) return true;
+    const lower = t.toLowerCase();
     // Mostly numbers/page refs (TOC pages)
     const digitRatio = (t.match(/\d/g) || []).length / t.length;
-    if(digitRatio > 0.18) return true;
+    if(digitRatio > 0.15) return true;
     // Copyright / publisher boilerplate
-    if(/©|all rights reserved|no part of this publication|isbn[ -]?\d|first intuition ltd|copyright \d{4}/i.test(t) && t.length < 1200) return true;
-    // Table of contents (mostly short lines with page numbers)
+    if(/©|all rights reserved|no part of this publication|isbn[ -]?\d|first intuition ltd|copyright \d{4}/i.test(lower) && t.length < 1500) return true;
+    // Exam admin / overview boilerplate (this is what was getting cited as chunk 4)
+    const adminPatterns = [
+      /your exam(?:ination)? is a \d+[\- ]hour/,
+      /computer[- ]based exam(?:ination)?/,
+      /full details of the syllabus can be found/,
+      /the syllabus can be found on the/,
+      /technical articles/,
+      /the acca publish/,
+      /useful additional reading/,
+      /three hours? for the exam/,
+      /the exam is divided into/,
+      /the cbe system/,
+    ];
+    let adminMatches = 0;
+    for(const p of adminPatterns){ if(p.test(lower)) adminMatches++; }
+    if(adminMatches >= 2 && t.length < 2000) return true;
+    // Table of contents
     const lines = t.split(/\s{2,}|\n/);
     const tocLike = lines.filter(l => /\d+\s*$/.test(l.trim()) && l.trim().length < 80).length;
     if(tocLike > 10 && tocLike / lines.length > 0.5) return true;
@@ -1236,9 +1253,77 @@
     for(let i = 1; i <= pdf.numPages; i++){
       const page = await pdf.getPage(i);
       const tc = await page.getTextContent();
-      text += tc.items.map(it => it.str).join(' ') + '\n\n';
+      text += extractPageText(tc) + '\n\n';
     }
+    // Post-processing: heal broken character spacing
+    text = healSpacing(text);
     return { text, pageCount: pdf.numPages };
+  }
+
+  // Smart text extraction that uses positional info to know when to add spaces
+  function extractPageText(textContent){
+    const items = textContent.items;
+    if(!items.length) return '';
+    // Sort by Y descending (PDF coords: Y increases up), then X ascending
+    // PDF.js already returns in reading order usually, but let's be safe
+    let out = '';
+    let prevItem = null;
+    for(const item of items){
+      const str = item.str;
+      if(!str) continue;
+      if(prevItem){
+        // Detect line break: Y changed significantly
+        const prevY = prevItem.transform[5];
+        const curY = item.transform[5];
+        const prevX = prevItem.transform[4];
+        const prevW = prevItem.width || 0;
+        const curX = item.transform[4];
+        const yDiff = Math.abs(curY - prevY);
+        const lineHeight = (item.height || prevItem.height || 12);
+
+        if(yDiff > lineHeight * 0.5){
+          // New line
+          out += '\n';
+        } else {
+          // Same line: decide whether to add space
+          const expectedX = prevX + prevW;
+          const gap = curX - expectedX;
+          const avgCharWidth = prevW / Math.max(prevItem.str.length, 1);
+          // If gap is larger than ~30% of avg char width, it's a real space
+          // If the previous item ended without trailing space AND current doesn't start with space, AND gap is meaningful
+          const prevEndsSpace = /\s$/.test(out);
+          const curStartsSpace = /^\s/.test(str);
+          if(!prevEndsSpace && !curStartsSpace && gap > avgCharWidth * 0.3){
+            out += ' ';
+          }
+          // If gap is tiny (kerning glyphs), don't add anything - characters belong together
+        }
+      }
+      out += str;
+      prevItem = item;
+    }
+    return out;
+  }
+
+  // Heal broken character spacing artifacts that survive extraction
+  // e.g. "AC C A AA C o u r s e No tes" -> "ACCA Audit course Notes"
+  function healSpacing(text){
+    // Pattern 1: Single letters separated by spaces (tracked headings/titles)
+    // "A C C A" -> "ACCA". Apply when 3+ single-letter tokens in a row.
+    text = text.replace(/(?:\b[A-Za-z]\s){2,}[A-Za-z]\b/g, (match) => {
+      return match.replace(/\s+/g, '');
+    });
+    // Pattern 2: Heal cases like "Cours e" -> "Course", "No tes" -> "Notes"
+    // (single-letter at end of word, separated by space, followed by word continuing)
+    // This is risky to do broadly. Apply conservatively: only when result is in word-like position.
+    // Heuristic: "wordA wordB" where wordA ends with letter and wordB starts with 1-2 letters then space — likely a broken split
+    // We'll leave subtle breaks alone since aggressive merging causes new errors. Pattern 1 handles the worst case.
+
+    // Pattern 3: Collapse runs of 3+ spaces to one space
+    text = text.replace(/ {3,}/g, ' ');
+    // Pattern 4: Normalise newlines (more than 2 in a row -> 2)
+    text = text.replace(/\n{3,}/g, '\n\n');
+    return text;
   }
 
   // ===== Web fetch via proxy =====
@@ -1414,7 +1499,7 @@
         const trimmed = chunk.length > targetCharsPerChunk
           ? chunk.substring(0, targetCharsPerChunk) + '...'
           : chunk;
-        out += `\n<<< [S${sNum}:${realIdx}] >>>\n${trimmed}\n<<< END [S${sNum}:${realIdx}] >>>\n`;
+        out += `\n--- BEGIN PASSAGE [S${sNum}:${realIdx}] ---\n${trimmed}\n--- END PASSAGE ---\n`;
       });
     });
     if(out.length > maxChars){
@@ -1433,7 +1518,7 @@
           const realIdx = cIdx + offset + 1;
           const chunk = src.chunks[cIdx];
           const trimmed = chunk.length > 1200 ? chunk.substring(0, 1200) + '...' : chunk;
-          out += `\n<<< [S${sNum}:${realIdx}] >>>\n${trimmed}\n<<< END [S${sNum}:${realIdx}] >>>\n`;
+          out += `\n--- BEGIN PASSAGE [S${sNum}:${realIdx}] ---\n${trimmed}\n--- END PASSAGE ---\n`;
         });
       });
     }
@@ -1453,9 +1538,9 @@
 
 HOW TO CITE (read carefully):
 Each passage in the sources is wrapped like:
-<<< [S1:3] >>>
+--- BEGIN PASSAGE [S1:3] ---
 ...passage text...
-<<< END [S1:3] >>>
+--- END PASSAGE ---
 
 The tag [S1:3] means Source 1, chunk 3. When you make a claim, the citation [S#:#] you write MUST match the EXACT tag of the passage that contains that information. Do NOT guess chunk numbers. Do NOT cite the first chunk by default. Scan the passages, find the one whose content actually supports your claim, then use that exact tag.
 
@@ -1505,7 +1590,7 @@ Return ONLY valid JSON. No markdown fences, no preamble.`;
     const prompt = `Create a polished briefing document from the sources. Output clean, readable markdown.
 
 CITATION RULES (CRITICAL):
-- Passages are wrapped <<< [S1:3] >>>...text...<<< END [S1:3] >>>
+- Passages are wrapped --- BEGIN PASSAGE [S1:3] ---...text...--- END PASSAGE ---
 - Place ONE citation at the END of each bullet point or paragraph, not in the middle of sentences
 - The citation must reference the passage that actually supports the claim
 - Use the EXACT tag from the source. Do NOT invent chunk numbers.
@@ -1544,7 +1629,7 @@ Return only the markdown briefing.`;
     const prompt = `Create a comprehensive, well-formatted study guide from these sources.
 
 CITATION RULES (CRITICAL):
-- Passages are wrapped <<< [S1:3] >>>...text...<<< END [S1:3] >>>
+- Passages are wrapped --- BEGIN PASSAGE [S1:3] ---...text...--- END PASSAGE ---
 - Place ONE citation at the END of each definition, bullet, or paragraph
 - NEVER put citations in the middle of a sentence
 - Match the EXACT chunk tag of the passage that supports the claim. Do NOT guess.
@@ -1588,7 +1673,7 @@ Return only the markdown.`;
     const prompt = `Generate 10-12 likely exam questions with detailed model answers from these sources.
 
 HOW TO CITE:
-Passages are wrapped like <<< [S1:3] >>>...text...<<< END [S1:3] >>>. When citing, use the EXACT tag of the passage that supports your answer. Do NOT guess chunk numbers.
+Passages are wrapped like --- BEGIN PASSAGE [S1:3] ---...text...--- END PASSAGE ---. When citing, use the EXACT tag of the passage that supports your answer. Do NOT guess chunk numbers.
 
 STYLE:
 Avoid em dashes (—); prefer commas or new sentences. Write naturally, not like a textbook.
@@ -1657,29 +1742,95 @@ Return ONLY JSON.`;
   }
 
   async function generateMindmap(notebook){
-    const context = buildGroundedContext(notebook, state.selectedSources, 50000, state.chapterFilter);
-    const prompt = `Create a visual mindmap of the core concepts in these sources.
+    const context = buildGroundedContext(notebook, state.selectedSources, 70000, state.chapterFilter);
 
-REQUIREMENTS:
-- 5-6 branches (sweet spot for visual balance)
-- Each branch is a major topic area, NOT a generic category
-- Each branch has 4-5 sub-points
-- Sub-points are SHORT phrases (3-7 words each), not full sentences
-- Central topic should be 2-5 words capturing the entire subject
+    // Determine if we should use chapter-aware structure
+    const selectedSources = notebook.sources.filter(s => !state.selectedSources || state.selectedSources.has(s.id));
+    const totalChapters = selectedSources.reduce((sum, s) => sum + ((s.chapters || []).length), 0);
+    const useChapterTopLevel = totalChapters >= 2 && !state.chapterFilter; // only if multiple chapters AND not focused on one
 
-JSON FORMAT:
+    const prompt = useChapterTopLevel ? `Create a DETAILED hierarchical mindmap of the study material. Structure it by CHAPTER first, then by concept, then by detailed sub-points.
+
+STRUCTURE: 3 levels of depth.
+
+JSON FORMAT (strict):
 {
-  "central": "Short subject name",
+  "central": "Subject name (3-6 words capturing the entire material)",
   "branches": [
-    { "title": "Topic Name (max 4 words)", "points": ["Short fact", "Key term defined", "Another key idea"] }
+    {
+      "title": "Chapter name or major topic (max 50 chars)",
+      "subBranches": [
+        {
+          "title": "Concept or sub-topic (max 40 chars)",
+          "points": ["specific fact or definition", "another key detail", "concrete example", "important rule or principle"]
+        }
+      ]
+    }
   ]
 }
+
+DEPTH REQUIREMENTS:
+- 4 to 8 top-level branches (chapters or major topics)
+- Each branch has 3 to 5 sub-branches (concepts within that topic)
+- Each sub-branch has 3 to 6 leaf points (specific facts, definitions, examples)
+- Leaf points are SHORT phrases (4-10 words), not full sentences
+- Include specific terminology, formulas, dates, names where they appear
+- Cover the BREADTH of the material — don't focus on one area
+
+EXAMPLES of good leaf points:
+- "Inherent risk: susceptibility before controls"
+- "Materiality threshold: 5-10% of profit"
+- "ISA 315 covers risk assessment"
+
+EXAMPLES of bad leaf points (too vague):
+- "Important concept"
+- "Things to remember"
+
+SOURCES:
+${context}
+
+Return ONLY valid JSON. No markdown fences. No preamble.` : `Create a DETAILED hierarchical mindmap of the study material with 3 levels of depth.
+
+STRUCTURE: central topic → major concepts → sub-concepts → specific details.
+
+JSON FORMAT (strict):
+{
+  "central": "Subject name (3-6 words)",
+  "branches": [
+    {
+      "title": "Major concept (max 50 chars)",
+      "subBranches": [
+        {
+          "title": "Sub-concept (max 40 chars)",
+          "points": ["specific fact", "key detail", "concrete example", "important rule"]
+        }
+      ]
+    }
+  ]
+}
+
+DEPTH REQUIREMENTS:
+- 5 to 8 top-level branches (major concepts/themes)
+- Each branch has 2 to 4 sub-branches (sub-concepts)
+- Each sub-branch has 3 to 6 leaf points (specific facts)
+- Leaf points are SHORT phrases (4-10 words), not full sentences
+- Include specific terminology, definitions, examples
 
 SOURCES:
 ${context}
 
 Return ONLY valid JSON. No markdown fences.`;
-    return await callGemini(prompt, true);
+    const result = await callGemini(prompt, true);
+
+    // Backward-compat: if AI returned old flat format, wrap it
+    if(result && result.branches && result.branches.length > 0 && !result.branches[0].subBranches){
+      // Convert flat branches to nested with single sub-branch
+      result.branches = result.branches.map(b => ({
+        title: b.title,
+        subBranches: [{ title: 'Key Points', points: b.points || [] }]
+      }));
+    }
+    return result;
   }
 
   // ===== Sidebar =====
@@ -2009,6 +2160,12 @@ Return ONLY valid JSON. No markdown fences.`;
     let html = msg.content;
     // Strip em dashes Gemini may still produce, replace with commas/periods contextually
     html = html.replace(/\s*—\s*/g, ', ').replace(/\s*–\s*/g, ', ');
+    // Strip any leaked chunk delimiters
+    html = html.replace(/<<<\s*\[S\d+:\d+\]\s*>>>/g, '');
+    html = html.replace(/<<<\s*END\s*\[S\d+:\d+\]\s*>>>/g, '');
+    html = html.replace(/<<<\s*END\s*\[?\d+\.?\d*\]?\s*>>>/g, '');
+    html = html.replace(/<<<[\s\S]{0,30}>>>/g, '');
+    html = html.replace(/\.\s*<<<.*$/gm, '.');
     // Escape HTML first (but preserve markdown formatting)
     html = html
       .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
@@ -2066,6 +2223,13 @@ Return ONLY valid JSON. No markdown fences.`;
     if(!text) return '';
     // Strip em dashes
     text = text.replace(/\s*—\s*/g, ', ').replace(/\s*–\s*/g, ', ');
+    // Safety net: strip any leaked chunk delimiters that Gemini may copy from the prompt
+    text = text.replace(/<<<\s*\[S\d+:\d+\]\s*>>>/g, '');
+    text = text.replace(/<<<\s*END\s*\[S\d+:\d+\]\s*>>>/g, '');
+    text = text.replace(/<<<\s*END\s*\[?\d+\.?\d*\]?\s*>>>/g, '');
+    text = text.replace(/<<<[\s\S]{0,30}>>>/g, ''); // catch any remaining variants
+    // Also handle bare delimiters at end of bullets
+    text = text.replace(/\.\s*<<<.*$/gm, '.');
     let html = text
       .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
       .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
@@ -2097,7 +2261,7 @@ Return ONLY valid JSON. No markdown fences.`;
   // ===== Citation popup =====
   function renderCitePopup(){
     if(!state.citePopup) return '';
-    const { sourceNum, chunkIdx } = state.citePopup;
+    const { sourceNum, chunkIdx, searchQuery } = state.citePopup;
     const nb = state.activeNotebook;
     if(!nb) return '';
     const src = nb.sources[sourceNum - 1];
@@ -2118,7 +2282,6 @@ Return ONLY valid JSON. No markdown fences.`;
     let outOfRange = false;
     if(!chunk){
       outOfRange = true;
-      // Show the closest available chunk instead
       if(src.chunks.length > 0){
         actualIdx = Math.max(1, Math.min(src.chunks.length, chunkIdx));
         chunk = src.chunks[actualIdx - 1];
@@ -2126,24 +2289,132 @@ Return ONLY valid JSON. No markdown fences.`;
     }
     if(!chunk) chunk = '(empty)';
 
+    // Detect if this passage looks like junk (exam admin / TOC / copyright)
+    const isJunk = looksLikeJunkPassage(chunk);
+
+    // Search results (if user typed something)
+    let searchResults = [];
+    if(searchQuery && searchQuery.length > 2){
+      const q = searchQuery.toLowerCase();
+      searchResults = src.chunks.map((c, i) => ({
+        idx: i + 1,
+        text: c,
+        score: scoreMatch(c.toLowerCase(), q),
+      })).filter(r => r.score > 0).sort((a,b) => b.score - a.score).slice(0, 5);
+    }
+
+    // Highlight search term in the passage
+    let displayChunk = escapeHTML(chunk);
+    if(searchQuery && searchQuery.length > 2){
+      const re = new RegExp('(' + escapeRegex(searchQuery) + ')', 'gi');
+      displayChunk = displayChunk.replace(re, '<mark style="background:#ff5b8a;color:#fff;padding:0 2px;border-radius:3px">$1</mark>');
+    }
+
+    // Chapter info if available
+    const chapters = src.chapters || [];
+    const containingChapter = chapters.find(c => actualIdx - 1 >= c.startChunk && actualIdx - 1 <= c.endChunk);
+
     return `
       <div class="modal-backdrop" data-action="close-cite">
-        <div class="cite-popup" onclick="event.stopPropagation()">
+        <div class="cite-popup" onclick="event.stopPropagation()" style="max-width:640px">
           <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:10px;gap:10px">
             <div style="flex:1;min-width:0">
               <div class="label">SOURCE ${sourceNum} · PASSAGE ${actualIdx}${outOfRange?` (closest to ${chunkIdx})`:''} OF ${src.chunks.length}</div>
-              <div class="source-name">${src.name}</div>
+              <div class="source-name">${escapeHTML(src.name)}</div>
+              ${containingChapter ? `<div style="font-size:12px;color:var(--pink);font-weight:600;margin-top:4px">📑 ${escapeHTML(containingChapter.label)}</div>` : ''}
             </div>
             <button class="btn btn-ghost btn-sm" data-action="close-cite" style="flex-shrink:0">✕</button>
           </div>
+
           ${outOfRange ? `<div style="font-size:12px;background:#fff8ec;border:2px dashed var(--ink);padding:8px 12px;border-radius:8px;margin-bottom:10px">⚠️ The AI cited passage ${chunkIdx} but this source only has ${src.chunks.length} passages. Showing closest match.</div>` : ''}
-          <div class="passage">${escapeHTML(chunk)}</div>
-          <div style="display:flex;gap:8px;margin-top:12px;justify-content:space-between">
-            <button class="btn btn-sm btn-ghost" data-action="cite-prev" ${actualIdx<=1?'disabled':''}>← Prev passage</button>
-            <button class="btn btn-sm btn-ghost" data-action="cite-next" ${actualIdx>=src.chunks.length?'disabled':''}>Next passage →</button>
+
+          ${isJunk ? `<div style="font-size:12px;background:#ffe5e5;border:2px solid var(--pink);padding:10px 12px;border-radius:10px;margin-bottom:10px;color:#a3104a;font-weight:500">
+            ⚠️ This passage looks like exam admin / table of contents / boilerplate. The AI probably picked the wrong passage. Try the search box below to find what was really meant.
+          </div>` : ''}
+
+          <div class="passage" style="white-space:pre-wrap">${displayChunk}</div>
+
+          <div style="display:flex;gap:8px;margin-top:12px;justify-content:space-between;flex-wrap:wrap">
+            <button class="btn btn-sm btn-ghost" data-action="cite-prev" ${actualIdx<=1?'disabled':''}>← Prev</button>
+            <span style="font-family:'JetBrains Mono',monospace;font-size:11px;color:rgba(26,21,48,.5);align-self:center">${actualIdx} / ${src.chunks.length}</span>
+            <button class="btn btn-sm btn-ghost" data-action="cite-next" ${actualIdx>=src.chunks.length?'disabled':''}>Next →</button>
+          </div>
+
+          <div style="margin-top:18px;border-top:2px dashed rgba(26,21,48,.15);padding-top:14px">
+            <div style="font-size:11px;font-weight:700;letter-spacing:.08em;color:var(--ink);margin-bottom:8px">🔍 SEARCH THIS SOURCE FOR THE REAL CONTENT</div>
+            <input id="cite-search" type="text" placeholder="e.g. familiarity threat, materiality, audit risk..." value="${escapeHTML(searchQuery||'')}" style="width:100%;padding:10px 12px;border:2px solid var(--ink);border-radius:10px;font-size:14px;font-family:inherit;font-weight:500" autofocus>
+            ${searchResults.length > 0 ? `
+              <div style="margin-top:10px;font-size:11px;font-weight:600;color:rgba(26,21,48,.6)">Top ${searchResults.length} matches:</div>
+              <div style="margin-top:6px;max-height:200px;overflow-y:auto">
+                ${searchResults.map(r => {
+                  // Snippet around match
+                  const lc = r.text.toLowerCase();
+                  const pos = lc.indexOf(searchQuery.toLowerCase());
+                  let snippet;
+                  if(pos >= 0){
+                    const start = Math.max(0, pos - 50);
+                    const end = Math.min(r.text.length, pos + searchQuery.length + 80);
+                    snippet = (start > 0 ? '…' : '') + r.text.substring(start, end) + (end < r.text.length ? '…' : '');
+                  } else {
+                    snippet = r.text.substring(0, 140) + '…';
+                  }
+                  const highlightedSnip = escapeHTML(snippet).replace(
+                    new RegExp('(' + escapeRegex(searchQuery) + ')', 'gi'),
+                    '<mark style="background:#ffd23f;padding:0 2px;border-radius:3px">$1</mark>'
+                  );
+                  return `<button data-action="jump-to-cite" data-idx="${r.idx}" style="display:block;width:100%;text-align:left;padding:10px 12px;border:2px solid var(--ink);border-radius:10px;background:#fff;margin-bottom:6px;cursor:pointer;font-family:inherit;transition:all .12s">
+                    <div style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--pink);font-weight:700;margin-bottom:3px">PASSAGE ${r.idx}</div>
+                    <div style="font-size:12.5px;line-height:1.4;font-weight:500">${highlightedSnip}</div>
+                  </button>`;
+                }).join('')}
+              </div>
+            ` : searchQuery && searchQuery.length > 2 ? `<div style="margin-top:10px;font-size:12px;color:rgba(26,21,48,.5);font-style:italic">No matches found in this source.</div>` : ''}
           </div>
         </div>
       </div>`;
+  }
+
+  function escapeRegex(s){ return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+
+  // Score how well a chunk matches a query (simple TF-style scoring)
+  function scoreMatch(chunkLower, queryLower){
+    if(!queryLower) return 0;
+    const queryWords = queryLower.split(/\s+/).filter(w => w.length > 2);
+    if(queryWords.length === 0) return 0;
+    let score = 0;
+    // Exact phrase match: huge boost
+    if(chunkLower.includes(queryLower)) score += 100;
+    // Each word match
+    for(const w of queryWords){
+      const matches = chunkLower.split(w).length - 1;
+      score += matches * 3;
+    }
+    return score;
+  }
+
+  // Detect passages that are just exam admin, TOC, or boilerplate (not real content)
+  function looksLikeJunkPassage(text){
+    if(!text || text.length < 100) return false;
+    const t = text.toLowerCase();
+    const junkPatterns = [
+      /your exam(?:ination)?\s+is\s+a/,
+      /computer[- ]based exam/,
+      /full details of the syllabus/,
+      /technical articles/,
+      /no part of this publication/,
+      /© first intuition/,
+      /all rights reserved/,
+      /isbn[ -]?\d/,
+      /table of contents/,
+      /^(?:chapter|section|unit|part|page)\s+\d+\s+\d+\s+(?:chapter|section|unit|part|page)\s+\d+/,
+    ];
+    for(const p of junkPatterns){
+      if(p.test(t)) return true;
+    }
+    // Very digit-heavy = probably TOC
+    const digits = (t.match(/\d/g) || []).length;
+    if(digits / t.length > 0.15) return true;
+    return false;
   }
 
   // ===== Quiz/Flashcards/Mindmap render (reused from previous) =====
@@ -2338,165 +2609,322 @@ Return ONLY valid JSON. No markdown fences.`;
 
   function renderMindmap(){
     const mm = state.currentMindmap;
-    const branchCount = mm.branches.length;
-    // Auto-switch to list on mobile (but respect explicit user choice if they toggled)
+    if(!mm || !mm.branches) return '<div class="main"><div class="card empty"><h3>Mindmap could not be generated</h3></div></div>';
+
     const isMobile = window.innerWidth < 700;
-    const viewMode = state.mindmapView === 'list' ? 'list' :
+    const isHierarchical = mm.branches.some(b => b.subBranches && b.subBranches.length > 0);
+
+    // Default to tree view for hierarchical, list for mobile
+    const viewMode = state.mindmapView === 'tree' ? 'tree' :
+                     state.mindmapView === 'list' ? 'list' :
                      state.mindmapView === 'radial' ? 'radial' :
-                     (isMobile ? 'list' : 'radial');
+                     (isMobile ? 'list' : (isHierarchical ? 'tree' : 'radial'));
 
-    // Build radial SVG
-    const colors = ['#ff5b8a','#2dd4bf','#b8e62e','#ffd23f','#8b5cf6','#ff7a3d','#ec4899'];
-    const W = 1200, H = 820;
-    const cx = W / 2, cy = H / 2;
-    const centerRadius = 100;
-    const branchRadius = 340;
-    const boxW = 220;
+    const colors = ['#ff5b8a','#2dd4bf','#b8e62e','#ffd23f','#8b5cf6','#ff7a3d','#ec4899','#06b6d4'];
 
-    // Layout: distribute branches in circle
-    const branches = mm.branches.map((b, i) => {
-      const angle = (i / branchCount) * 2 * Math.PI - Math.PI / 2;
-      const x = cx + Math.cos(angle) * branchRadius;
-      const y = cy + Math.sin(angle) * branchRadius;
-      const color = colors[i % colors.length];
-      const boxH = 56 + Math.min(b.points.length, 5) * 22;
+    // ===== Horizontal tree SVG =====
+    function buildTreeSvg(){
+      // Layout parameters
+      const ROW_H = 28;          // height per leaf point
+      const SUB_GAP = 18;        // gap between sub-branches
+      const BRANCH_GAP = 36;     // gap between top-level branches
+      const COL1_W = 280;        // branch box width
+      const COL2_W = 220;        // sub-branch box width
+      const COL3_W = 360;        // leaf cluster width
+      const COL_GAP = 70;        // horizontal gap between columns
+      const PADDING = 60;        // canvas padding
+      const CENTER_W = 220;      // central node width
+      const CENTER_H = 110;
 
-      // Anchor box so it doesn't cross center, and stays in canvas
-      let anchorX, anchorY;
-      const cos = Math.cos(angle), sin = Math.sin(angle);
-      // Horizontal positioning based on which side
-      if(cos > 0.3) anchorX = x;            // right side: box extends right
-      else if(cos < -0.3) anchorX = x - boxW;  // left side: box extends left
-      else anchorX = x - boxW / 2;             // top/bottom: centered
-      // Vertical positioning
-      anchorY = y - boxH / 2;
-      // Clamp to canvas with padding
-      anchorX = Math.max(20, Math.min(W - boxW - 20, anchorX));
-      anchorY = Math.max(20, Math.min(H - boxH - 20, anchorY));
+      // Compute layout: each sub-branch needs height = its points * ROW_H + header
+      // Each branch needs height = sum of sub-branch heights + gaps
+      let totalHeight = 0;
+      const layout = mm.branches.map((b, bi) => {
+        const subs = (b.subBranches || []).map(sb => {
+          const pts = sb.points || [];
+          const h = Math.max(44, 42 + pts.length * ROW_H);
+          return { ...sb, h, points: pts };
+        });
+        const branchH = Math.max(70, subs.reduce((s, sb) => s + sb.h + SUB_GAP, -SUB_GAP));
+        totalHeight += branchH + BRANCH_GAP;
+        return { ...b, subs, h: branchH };
+      });
+      totalHeight -= BRANCH_GAP;
+      totalHeight = Math.max(totalHeight, CENTER_H + 80);
 
-      // Box center for connecting line
-      const boxCenterX = anchorX + boxW / 2;
-      const boxCenterY = anchorY + boxH / 2;
+      const W = PADDING * 2 + CENTER_W + COL_GAP + COL1_W + COL_GAP + COL2_W + COL_GAP + COL3_W;
+      const H = totalHeight + PADDING * 2;
 
-      // Pick connection point on box edge facing center
-      let connX, connY;
-      const dx = cx - boxCenterX, dy = cy - boxCenterY;
-      if(Math.abs(dx) * boxH > Math.abs(dy) * boxW){
-        // Horizontal edge dominant
-        connX = dx > 0 ? anchorX : anchorX + boxW;
-        connY = boxCenterY;
-      } else {
-        // Vertical edge dominant
-        connX = boxCenterX;
-        connY = dy > 0 ? anchorY : anchorY + boxH;
+      // X positions of each column
+      const centerX = PADDING;
+      const col1X = centerX + CENTER_W + COL_GAP;        // branches
+      const col2X = col1X + COL1_W + COL_GAP;            // sub-branches
+      const col3X = col2X + COL2_W + COL_GAP;            // leaf points
+
+      // Central node Y (vertical center)
+      const centerY = H / 2 - CENTER_H / 2;
+      const centerCx = centerX + CENTER_W / 2;
+      const centerCy = H / 2;
+
+      // Position each branch
+      let cursorY = PADDING;
+      const placedBranches = layout.map((b, bi) => {
+        const color = colors[bi % colors.length];
+        const branchY = cursorY;
+        const branchCy = cursorY + b.h / 2;
+        cursorY += b.h + BRANCH_GAP;
+
+        // Position sub-branches within this branch's vertical range
+        let subCursor = branchY;
+        const subs = b.subs.map((sb, si) => {
+          const subY = subCursor;
+          const subCy = subY + sb.h / 2;
+          subCursor += sb.h + SUB_GAP;
+          return { ...sb, y: subY, cy: subCy };
+        });
+
+        return { ...b, color, y: branchY, cy: branchCy, subs };
+      });
+
+      // Connection paths (smooth bezier curves)
+      function curvedPath(x1, y1, x2, y2){
+        const midX = (x1 + x2) / 2;
+        return `M ${x1} ${y1} C ${midX} ${y1}, ${midX} ${y2}, ${x2} ${y2}`;
       }
 
-      // Center connection point on circle edge
-      const centerEdgeX = cx + Math.cos(angle) * centerRadius;
-      const centerEdgeY = cy + Math.sin(angle) * centerRadius;
+      return `
+        <svg viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg" style="display:block;font-family:'Outfit',sans-serif;min-width:${Math.min(W, 1200)}px">
+          <defs>
+            <pattern id="dotpattern" x="0" y="0" width="20" height="20" patternUnits="userSpaceOnUse">
+              <circle cx="10" cy="10" r="1" fill="#1a1530" opacity="0.06"/>
+            </pattern>
+          </defs>
+          <rect width="${W}" height="${H}" fill="url(#dotpattern)"/>
 
-      // Smooth curved path (quadratic bezier)
-      const midX = (centerEdgeX + connX) / 2;
-      const midY = (centerEdgeY + connY) / 2;
-      // Add slight curve based on angle
-      const curveOffset = 30 * Math.sin(angle * 2);
-      const controlX = midX - sin * curveOffset;
-      const controlY = midY + cos * curveOffset;
-      const path = `M ${centerEdgeX} ${centerEdgeY} Q ${controlX} ${controlY} ${connX} ${connY}`;
+          <!-- Central to branches (curves) -->
+          ${placedBranches.map(b => {
+            const branchY = b.cy;
+            return `<path d="${curvedPath(centerX + CENTER_W, centerCy, col1X, branchY)}" stroke="${b.color}" stroke-width="4" fill="none" stroke-linecap="round" opacity="0.85"/>`;
+          }).join('')}
 
-      return { ...b, color, anchorX, anchorY, boxH, path };
-    });
+          <!-- Branch to sub-branches -->
+          ${placedBranches.map(b => b.subs.map(sb =>
+            `<path d="${curvedPath(col1X + COL1_W, b.cy, col2X, sb.cy)}" stroke="${b.color}" stroke-width="3" fill="none" stroke-linecap="round" opacity="0.7"/>`
+          ).join('')).join('')}
 
-    const radialSvg = `
-      <svg viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg" style="width:100%;height:auto;display:block;font-family:'Outfit',sans-serif">
-        <!-- Dotted background -->
-        <defs>
-          <pattern id="dots" x="0" y="0" width="20" height="20" patternUnits="userSpaceOnUse">
-            <circle cx="10" cy="10" r="1" fill="#1a1530" opacity="0.08"/>
-          </pattern>
-        </defs>
-        <rect width="${W}" height="${H}" fill="url(#dots)"/>
+          <!-- Sub-branch to leaf cluster -->
+          ${placedBranches.map(b => b.subs.map(sb =>
+            `<path d="${curvedPath(col2X + COL2_W, sb.cy, col3X, sb.cy)}" stroke="${b.color}" stroke-width="2" fill="none" stroke-linecap="round" opacity="0.5" stroke-dasharray="4,4"/>`
+          ).join('')).join('')}
 
-        <!-- Connection paths (drawn first, behind boxes) -->
-        ${branches.map(b => `
-          <path d="${b.path}" stroke="${b.color}" stroke-width="4" fill="none" stroke-linecap="round" opacity="0.9"/>
-          <path d="${b.path}" stroke="#1a1530" stroke-width="1.5" fill="none" stroke-linecap="round" opacity="0.3"/>
-        `).join('')}
+          <!-- Branches -->
+          ${placedBranches.map(b => {
+            const titleLines = wrapWords(b.title, 26);
+            const bh = Math.max(60, 22 + titleLines.length * 22);
+            const by = b.cy - bh / 2;
+            return `
+              <g>
+                <rect x="${col1X + 4}" y="${by + 4}" width="${COL1_W}" height="${bh}" rx="14" fill="#1a1530" opacity="0.2"/>
+                <rect x="${col1X}" y="${by}" width="${COL1_W}" height="${bh}" rx="14" fill="${b.color}" stroke="#1a1530" stroke-width="3"/>
+                ${titleLines.map((line, li) => `
+                  <text x="${col1X + COL1_W / 2}" y="${by + 26 + li * 22}" font-size="16" font-weight="800" fill="#1a1530" font-family="Fraunces, serif" text-anchor="middle">${escapeHTML(line)}</text>
+                `).join('')}
+              </g>
+            `;
+          }).join('')}
 
-        <!-- Branch boxes -->
-        ${branches.map(b => `
-          <g transform="translate(${b.anchorX},${b.anchorY})">
-            <rect x="4" y="4" width="${boxW}" height="${b.boxH}" rx="14" ry="14" fill="#1a1530" opacity="0.2"/>
-            <rect x="0" y="0" width="${boxW}" height="${b.boxH}" rx="14" ry="14" fill="${b.color}" stroke="#1a1530" stroke-width="3"/>
-            <text x="14" y="26" font-size="15" font-weight="700" fill="#1a1530" font-family="Fraunces, serif">${escapeHTML(b.title.substring(0, 30))}</text>
-            <line x1="14" y1="34" x2="${boxW - 14}" y2="34" stroke="#1a1530" stroke-width="1.5" stroke-dasharray="2,3" opacity="0.4"/>
-            ${b.points.slice(0, 5).map((p, j) => `
-              <text x="14" y="${52 + j * 22}" font-size="12" fill="#1a1530" font-weight="500">${escapeHTML('• ' + p.substring(0, 36) + (p.length > 36 ? '…' : ''))}</text>
-            `).join('')}
-          </g>
-        `).join('')}
+          <!-- Sub-branches -->
+          ${placedBranches.map(b => b.subs.map(sb => {
+            const titleLines = wrapWords(sb.title, 22);
+            const sh = Math.max(40, 20 + titleLines.length * 18);
+            const sy = sb.cy - sh / 2;
+            return `
+              <g>
+                <rect x="${col2X + 3}" y="${sy + 3}" width="${COL2_W}" height="${sh}" rx="10" fill="#1a1530" opacity="0.15"/>
+                <rect x="${col2X}" y="${sy}" width="${COL2_W}" height="${sh}" rx="10" fill="#fff" stroke="${b.color}" stroke-width="3"/>
+                ${titleLines.map((line, li) => `
+                  <text x="${col2X + COL2_W / 2}" y="${sy + 22 + li * 18}" font-size="13" font-weight="700" fill="#1a1530" font-family="Outfit, sans-serif" text-anchor="middle">${escapeHTML(line)}</text>
+                `).join('')}
+              </g>
+            `;
+          }).join('')).join('')}
 
-        <!-- Center circle -->
-        <circle cx="${cx}" cy="${cy}" r="${centerRadius + 6}" fill="none" stroke="#ffd23f" stroke-width="2" stroke-dasharray="5,5"/>
-        <circle cx="${cx}" cy="${cy}" r="${centerRadius}" fill="#1a1530" stroke="#1a1530" stroke-width="3"/>
-        ${wrapSvgText(mm.central, cx, cy, centerRadius - 18, 17)}
-      </svg>
-    `;
+          <!-- Leaf points -->
+          ${placedBranches.map(b => b.subs.map(sb => {
+            const startY = sb.cy - (sb.points.length * ROW_H) / 2;
+            return sb.points.map((pt, pi) => {
+              const y = startY + pi * ROW_H;
+              const truncated = pt.length > 58 ? pt.substring(0, 55) + '…' : pt;
+              return `
+                <g>
+                  <circle cx="${col3X + 8}" cy="${y + ROW_H/2}" r="4" fill="${b.color}" stroke="#1a1530" stroke-width="1.5"/>
+                  <text x="${col3X + 22}" y="${y + ROW_H/2 + 4}" font-size="12.5" fill="#1a1530" font-weight="500" font-family="Outfit, sans-serif">${escapeHTML(truncated)}</text>
+                </g>
+              `;
+            }).join('');
+          }).join('')).join('')}
 
+          <!-- Central node -->
+          <rect x="${centerX + 5}" y="${centerY + 5}" width="${CENTER_W}" height="${CENTER_H}" rx="18" fill="#1a1530" opacity="0.3"/>
+          <rect x="${centerX}" y="${centerY}" width="${CENTER_W}" height="${CENTER_H}" rx="18" fill="#1a1530" stroke="#1a1530" stroke-width="3"/>
+          <rect x="${centerX + 4}" y="${centerY + 4}" width="${CENTER_W - 8}" height="${CENTER_H - 8}" rx="14" fill="none" stroke="#ffd23f" stroke-width="2" stroke-dasharray="5,4" opacity="0.7"/>
+          ${centerTextSvg(mm.central, centerCx, centerCy, CENTER_W - 30)}
+        </svg>
+      `;
+    }
+
+    // ===== Radial SVG (for non-hierarchical maps) =====
+    function buildRadialSvg(){
+      const branchCount = mm.branches.length;
+      const W = 1200, H = 820;
+      const cx = W / 2, cy = H / 2;
+      const centerRadius = 100;
+      const branchRadius = 340;
+      const boxW = 240;
+
+      const branches = mm.branches.map((b, i) => {
+        const angle = (i / branchCount) * 2 * Math.PI - Math.PI / 2;
+        const x = cx + Math.cos(angle) * branchRadius;
+        const y = cy + Math.sin(angle) * branchRadius;
+        const color = colors[i % colors.length];
+        // Flatten sub-branches to a list of points for display
+        const allPoints = (b.subBranches && b.subBranches.length > 0)
+          ? b.subBranches.flatMap(sb => [`▸ ${sb.title}`, ...(sb.points || []).slice(0, 3).map(p => '  · ' + p)])
+          : (b.points || []);
+        const boxH = 56 + Math.min(allPoints.length, 8) * 20;
+
+        let anchorX, anchorY;
+        const cosA = Math.cos(angle), sinA = Math.sin(angle);
+        if(cosA > 0.3) anchorX = x;
+        else if(cosA < -0.3) anchorX = x - boxW;
+        else anchorX = x - boxW / 2;
+        anchorY = y - boxH / 2;
+        anchorX = Math.max(20, Math.min(W - boxW - 20, anchorX));
+        anchorY = Math.max(20, Math.min(H - boxH - 20, anchorY));
+
+        const boxCenterY = anchorY + boxH / 2;
+        let connX, connY;
+        const dx = cx - (anchorX + boxW / 2), dy = cy - boxCenterY;
+        if(Math.abs(dx) * boxH > Math.abs(dy) * boxW){
+          connX = dx > 0 ? anchorX : anchorX + boxW;
+          connY = boxCenterY;
+        } else {
+          connX = anchorX + boxW / 2;
+          connY = dy > 0 ? anchorY : anchorY + boxH;
+        }
+        const edgeX = cx + Math.cos(angle) * centerRadius;
+        const edgeY = cy + Math.sin(angle) * centerRadius;
+        const midX = (edgeX + connX) / 2;
+        const midY = (edgeY + connY) / 2;
+        const curveOff = 25 * Math.sin(angle * 2);
+        const ctrlX = midX - sinA * curveOff;
+        const ctrlY = midY + cosA * curveOff;
+        const path = `M ${edgeX} ${edgeY} Q ${ctrlX} ${ctrlY} ${connX} ${connY}`;
+
+        return { ...b, color, anchorX, anchorY, boxH, path, allPoints };
+      });
+
+      return `
+        <svg viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg" style="width:100%;height:auto;display:block;font-family:'Outfit',sans-serif">
+          <defs>
+            <pattern id="rdots" x="0" y="0" width="20" height="20" patternUnits="userSpaceOnUse">
+              <circle cx="10" cy="10" r="1" fill="#1a1530" opacity="0.08"/>
+            </pattern>
+          </defs>
+          <rect width="${W}" height="${H}" fill="url(#rdots)"/>
+          ${branches.map(b => `
+            <path d="${b.path}" stroke="${b.color}" stroke-width="4" fill="none" stroke-linecap="round" opacity="0.9"/>
+          `).join('')}
+          ${branches.map(b => `
+            <g transform="translate(${b.anchorX},${b.anchorY})">
+              <rect x="4" y="4" width="${boxW}" height="${b.boxH}" rx="14" fill="#1a1530" opacity="0.2"/>
+              <rect x="0" y="0" width="${boxW}" height="${b.boxH}" rx="14" fill="${b.color}" stroke="#1a1530" stroke-width="3"/>
+              <text x="14" y="26" font-size="15" font-weight="700" fill="#1a1530" font-family="Fraunces, serif">${escapeHTML(b.title.substring(0, 32))}</text>
+              <line x1="14" y1="34" x2="${boxW - 14}" y2="34" stroke="#1a1530" stroke-width="1.5" stroke-dasharray="2,3" opacity="0.4"/>
+              ${b.allPoints.slice(0, 8).map((p, j) => `
+                <text x="14" y="${52 + j * 20}" font-size="11.5" fill="#1a1530" font-weight="500">${escapeHTML(p.substring(0, 38) + (p.length > 38 ? '…' : ''))}</text>
+              `).join('')}
+            </g>
+          `).join('')}
+          <circle cx="${cx}" cy="${cy}" r="${centerRadius + 6}" fill="none" stroke="#ffd23f" stroke-width="2" stroke-dasharray="5,5"/>
+          <circle cx="${cx}" cy="${cy}" r="${centerRadius}" fill="#1a1530" stroke="#1a1530" stroke-width="3"/>
+          ${wrapSvgText(mm.central, cx, cy, centerRadius - 18, 17)}
+        </svg>
+      `;
+    }
+
+    // ===== List view (hierarchical) =====
     const listView = `
-      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:18px">
+      <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:18px">
         ${mm.branches.map((b, i) => {
           const color = colors[i % colors.length];
+          const subs = b.subBranches || (b.points ? [{title: 'Key Points', points: b.points}] : []);
           return `
             <div style="border:3px solid var(--ink);border-radius:18px;background:${color};padding:18px;box-shadow:var(--shadow-sm)">
-              <h3 style="font-family:'Fraunces',serif;font-size:18px;margin-bottom:10px">${escapeHTML(b.title)}</h3>
-              <ul style="list-style:none;padding:0">
-                ${b.points.map(p => `<li style="padding:8px 0;border-top:2px dashed rgba(26,21,48,.25);font-size:14px;line-height:1.4;font-weight:500">• ${escapeHTML(p)}</li>`).join('')}
-              </ul>
+              <h3 style="font-family:'Fraunces',serif;font-size:18px;margin-bottom:12px;line-height:1.2">${escapeHTML(b.title)}</h3>
+              ${subs.map(sb => `
+                <div style="background:#fff;border:2px solid var(--ink);border-radius:12px;padding:10px 12px;margin-bottom:8px">
+                  <div style="font-weight:700;font-size:13px;margin-bottom:6px">${escapeHTML(sb.title)}</div>
+                  <ul style="list-style:none;padding:0;margin:0">
+                    ${(sb.points || []).map(p => `<li style="padding:4px 0;font-size:12.5px;line-height:1.4;font-weight:500;display:flex;gap:6px"><span style="color:${color}">▸</span><span>${escapeHTML(p)}</span></li>`).join('')}
+                  </ul>
+                </div>
+              `).join('')}
             </div>
           `;
         }).join('')}
       </div>`;
+
+    const svgContent =
+      viewMode === 'tree' ? buildTreeSvg() :
+      viewMode === 'radial' ? buildRadialSvg() :
+      listView;
 
     return `
       <div class="main">
         <div style="display:flex;align-items:center;gap:10px;margin-bottom:18px;flex-wrap:wrap">
           <button class="btn btn-sm btn-ghost" data-action="mind-exit">← Back</button>
           <h1 style="font-size:28px;margin:0;flex:1">🗺️ Mindmap</h1>
-          <div style="display:flex;gap:6px;border:3px solid var(--ink);border-radius:12px;padding:4px;background:#fff">
+          <div style="display:flex;gap:6px;border:3px solid var(--ink);border-radius:12px;padding:4px;background:#fff;flex-wrap:wrap">
+            <button class="btn btn-sm ${viewMode==='tree'?'':'btn-ghost'}" data-action="mind-view" data-mode="tree" style="${viewMode==='tree'?'box-shadow:2px 2px 0 var(--ink)':'box-shadow:none'};padding:6px 12px;font-size:12px">🌳 Tree</button>
             <button class="btn btn-sm ${viewMode==='radial'?'':'btn-ghost'}" data-action="mind-view" data-mode="radial" style="${viewMode==='radial'?'box-shadow:2px 2px 0 var(--ink)':'box-shadow:none'};padding:6px 12px;font-size:12px">⊕ Radial</button>
             <button class="btn btn-sm ${viewMode==='list'?'':'btn-ghost'}" data-action="mind-view" data-mode="list" style="${viewMode==='list'?'box-shadow:2px 2px 0 var(--ink)':'box-shadow:none'};padding:6px 12px;font-size:12px">☰ List</button>
           </div>
           <button class="btn btn-sm btn-teal" data-action="mind-download">⬇️ PNG</button>
         </div>
-        <div class="mindmap-wrap" id="mindmapWrap">
-          ${viewMode === 'radial' ? radialSvg : listView}
+        <div class="mindmap-wrap" id="mindmapWrap" style="overflow:auto;max-width:100%">
+          ${svgContent}
         </div>
       </div>`;
   }
 
-  // Helper: split text into lines that fit within a width, render as tspan
-  function wrapSvgText(text, cx, cy, maxWidth, fontSize){
-    const words = text.split(/\s+/);
+  // Helpers for SVG text
+  function wrapWords(text, maxChars){
+    if(!text) return [''];
+    const words = String(text).split(/\s+/);
     const lines = [];
-    let current = '';
-    const charWidth = fontSize * 0.55;
-    const maxChars = Math.floor((maxWidth * 2) / charWidth);
+    let cur = '';
     for(const w of words){
-      const candidate = current ? current + ' ' + w : w;
-      if(candidate.length > maxChars && current){
-        lines.push(current);
-        current = w;
-      } else {
-        current = candidate;
-      }
+      const cand = cur ? cur + ' ' + w : w;
+      if(cand.length > maxChars && cur){ lines.push(cur); cur = w; }
+      else cur = cand;
     }
-    if(current) lines.push(current);
-    const total = lines.length;
-    const startY = cy - ((total - 1) * fontSize * 0.6);
+    if(cur) lines.push(cur);
+    return lines.length ? lines : [''];
+  }
+
+  function centerTextSvg(text, cx, cy, maxWidth){
+    const lines = wrapWords(text, 18);
+    const fontSize = lines.length > 2 ? 15 : 17;
+    const startY = cy - ((lines.length - 1) * fontSize * 0.65);
     return `<text x="${cx}" y="${startY}" font-size="${fontSize}" fill="#ffd23f" font-weight="800" font-family="Fraunces, serif" text-anchor="middle" dominant-baseline="middle">
-      ${lines.map((l, i) => `<tspan x="${cx}" dy="${i === 0 ? 0 : fontSize * 1.2}">${escapeHTML(l)}</tspan>`).join('')}
+      ${lines.map((l, i) => `<tspan x="${cx}" dy="${i === 0 ? 0 : fontSize * 1.3}">${escapeHTML(l)}</tspan>`).join('')}
     </text>`;
+  }
+
+  // Legacy helper kept for radial center text
+  function wrapSvgText(text, cx, cy, maxWidth, fontSize){
+    return centerTextSvg(text, cx, cy, maxWidth);
   }
 
   function renderResultsPage(){
@@ -2875,6 +3303,31 @@ service cloud.firestore {
     // auto-scroll chat to bottom
     const cm = $('chatMsgs');
     if(cm) cm.scrollTop = cm.scrollHeight;
+
+    // Citation popup search input (debounced)
+    const citeSearch = $('cite-search');
+    if(citeSearch){
+      // Preserve focus + cursor position across re-renders
+      if(state.citePopup && state.citePopup._refocus){
+        citeSearch.focus();
+        try { citeSearch.setSelectionRange(state.citePopup._cursorPos || 0, state.citePopup._cursorPos || 0); } catch(e){}
+        state.citePopup._refocus = false;
+      }
+      let searchTimer;
+      citeSearch.oninput = (e) => {
+        const val = e.target.value;
+        const cursorPos = e.target.selectionStart;
+        clearTimeout(searchTimer);
+        searchTimer = setTimeout(() => {
+          if(state.citePopup){
+            state.citePopup.searchQuery = val;
+            state.citePopup._refocus = true;
+            state.citePopup._cursorPos = cursorPos;
+            render();
+          }
+        }, 250);
+      };
+    }
   }
 
   function handleAction(action, data, el, evt){
@@ -3150,6 +3603,12 @@ service cloud.firestore {
         const src = state.activeNotebook.sources[state.citePopup.sourceNum - 1];
         if(src) state.citePopup.chunkIdx = Math.min(src.chunks.length, state.citePopup.chunkIdx + 1);
         render(); break;
+      }
+      case 'jump-to-cite': {
+        state.citePopup.chunkIdx = parseInt(data.idx);
+        // Keep the search query so user can see why this passage matched
+        render();
+        break;
       }
       case 'close-studio':
         state.studioView = null; render(); break;
