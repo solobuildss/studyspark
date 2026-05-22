@@ -371,8 +371,40 @@
 <body>
 <div id="app" class="app"></div>
 <script type="module">
+  // ===============================================================
+  // ====  EMBEDDED FIREBASE CONFIG  ===============================
+  // ====  FILL IN YOUR VALUES BELOW BEFORE DEPLOYING  =============
+  // ===============================================================
+  //
+  // These are safe to commit to a public repo. Firebase is designed so
+  // the config can be public — security comes from Firestore rules +
+  // the email allowlist below.
+  //
+  // To get these values:
+  // 1. Firebase Console → Project Settings (gear icon) → General tab
+  // 2. Scroll to "Your apps" → web app
+  // 3. Copy projectId, apiKey, authDomain into the strings below
+  //
+  // Set EMBEDDED_CONFIG.enabled = false to disable auto-config and
+  // fall back to the manual setup flow (where you paste config in-app).
+  //
+  const EMBEDDED_CONFIG = {
+    enabled: true,  // Set to false to use manual sync setup instead
+
+    projectId: 'studyspark-fc6f9',          // e.g. 'studyspark-a1b2c'
+    apiKey:    'AIzaSyCGhZ5PhyLPUZutXIbooyl_GqveKhYfyzI',    // e.g. 'AIzaSy...'
+    authDomain:'studyspark-fc6f9.firebaseapp.com',         // e.g. 'studyspark-a1b2c.firebaseapp.com'
+
+    // Email allowlist - ONLY these emails can sign in.
+    // Add yours (lowercase) and any family/team members you want to grant access.
+    allowedEmails: [
+      'sawandobariya.uk@gmail.com',
+    ],
+  };
+  // ===============================================================
+
   // ===== Firebase (lazy-loaded only when sync is enabled) =====
-  let fb = null; // { app, auth, db, user, syncCode, listeners: [], suppressNext: false }
+  let fb = null; // { app, auth, db, user, listeners: [], suppressNext: false, googleUser: {...} }
   async function loadFirebase(){
     if(window._firebaseLoaded) return window._firebaseLoaded;
     const V = '12.13.0';
@@ -385,6 +417,14 @@
     return window._firebaseLoaded;
   }
 
+  function configIsEmbedded(){
+    return EMBEDDED_CONFIG.enabled
+      && EMBEDDED_CONFIG.projectId
+      && !EMBEDDED_CONFIG.projectId.includes('YOUR_')
+      && EMBEDDED_CONFIG.apiKey
+      && !EMBEDDED_CONFIG.apiKey.includes('YOUR_');
+  }
+
   // ===== State =====
   const state = {
     page: 'home',
@@ -393,8 +433,10 @@
     results: JSON.parse(localStorage.getItem('ss_results') || '[]'),
     chatHistory: JSON.parse(localStorage.getItem('ss_chat') || '{}'),
     syncConfig: JSON.parse(localStorage.getItem('ss_sync_config') || 'null'), // {projectId, apiKey, authDomain, syncCode}
-    syncStatus: 'offline', // offline | connecting | live | error
+    syncStatus: 'offline', // offline | connecting | live | error | signin-needed | unauthorized
     syncError: '',
+    googleUser: null, // {email, name, photoURL, uid}
+    signInPending: false,
     mobileTab: 'chat', // sources | chat | studio - which panel shows on mobile
     activeNotebook: null,
     selectedSources: null, // Set of source IDs selected for chat/study aids (null = all)
@@ -531,6 +573,212 @@
     }));
   }
 
+  // Returns the Firestore path identifier for the current user.
+  // When using Google auth, this is the user's UID (so the same email = same data).
+  // When using anonymous auth, falls back to the manual sync code.
+  function getSyncPath(){
+    if(!fb) return null;
+    if(fb.googleUser) return fb.googleUser.uid;
+    return fb.syncCode;
+  }
+
+  // ===== Google Sign-In flow =====
+  async function initGoogleAuth(){
+    if(!configIsEmbedded()){
+      console.warn('No embedded config - skipping Google auth init');
+      return;
+    }
+    state.syncStatus = 'connecting';
+    render();
+    try {
+      const { app, auth, fs } = await loadFirebase();
+      // Initialize Firebase with the embedded config
+      const fbApp = app.initializeApp({
+        apiKey: EMBEDDED_CONFIG.apiKey,
+        authDomain: EMBEDDED_CONFIG.authDomain,
+        projectId: EMBEDDED_CONFIG.projectId,
+      }, 'studyspark_main');
+      const fbAuth = auth.getAuth(fbApp);
+      const fbDb = fs.getFirestore(fbApp);
+      // Set local persistence so user stays logged in across refreshes
+      try { await auth.setPersistence(fbAuth, auth.browserLocalPersistence); } catch(e){ /* ignore */ }
+      // Save partial fb object for sign-in modal to use
+      fb = { app: fbApp, auth: fbAuth, db: fbDb, fs, listeners: [], suppressNext: false, user: null, googleUser: null };
+
+      // Listen for auth state changes (covers redirect-back too)
+      auth.onAuthStateChanged(fbAuth, async (user) => {
+        if(user && user.email){
+          // Check allowlist
+          const allowed = EMBEDDED_CONFIG.allowedEmails.map(e => e.trim().toLowerCase());
+          if(!allowed.includes(user.email.toLowerCase())){
+            state.syncStatus = 'unauthorized';
+            state.syncError = `${user.email} is not authorized to use this app.`;
+            await auth.signOut(fbAuth);
+            fb.user = null; fb.googleUser = null;
+            render();
+            return;
+          }
+          // Authorized - set up
+          fb.user = user;
+          fb.googleUser = {
+            uid: user.uid,
+            email: user.email,
+            name: user.displayName,
+            photoURL: user.photoURL,
+          };
+          state.googleUser = fb.googleUser;
+          state.signInPending = false;
+
+          // Try to fetch saved Gemini API key from Firestore
+          await loadGeminiKeyFromCloud();
+
+          // Begin sync
+          await beginSyncForGoogleUser();
+        } else {
+          // Signed out
+          fb.user = null; fb.googleUser = null;
+          state.googleUser = null;
+          state.syncStatus = 'signin-needed';
+          render();
+        }
+      });
+    } catch(e){
+      console.error(e);
+      state.syncStatus = 'error';
+      state.syncError = e.message || 'Failed to initialize';
+      render();
+    }
+  }
+
+  async function signInWithGoogle(){
+    if(!fb || !fb.auth){
+      await initGoogleAuth();
+      // Wait briefly for fb to be ready
+      await new Promise(r => setTimeout(r, 200));
+    }
+    if(!fb || !fb.auth){ toast('❌ Auth not initialized'); return; }
+    const { auth } = await loadFirebase();
+    const provider = new auth.GoogleAuthProvider();
+    provider.setCustomParameters({ prompt: 'select_account' });
+    state.signInPending = true;
+    render();
+    try {
+      await auth.signInWithPopup(fb.auth, provider);
+      // onAuthStateChanged handles the rest
+    } catch(e){
+      state.signInPending = false;
+      console.error(e);
+      if(e.code === 'auth/popup-closed-by-user' || e.code === 'auth/cancelled-popup-request'){
+        // user dismissed, no toast
+      } else if(e.code === 'auth/popup-blocked' || e.code === 'auth/unauthorized-domain'){
+        // Fallback to redirect (popup blocked, mobile, etc.)
+        try {
+          await auth.signInWithRedirect(fb.auth, provider);
+        } catch(e2){
+          toast('❌ ' + (e2.message || 'Sign-in failed'));
+        }
+      } else {
+        toast('❌ ' + (e.message || 'Sign-in failed'));
+      }
+      render();
+    }
+  }
+
+  async function signOutGoogle(){
+    if(!fb || !fb.auth) return;
+    const { auth } = await loadFirebase();
+    // Stop listeners
+    fb.listeners.forEach(u => u());
+    fb.listeners = [];
+    await auth.signOut(fb.auth);
+    state.googleUser = null;
+    state.syncStatus = 'signin-needed';
+    render();
+  }
+
+  async function loadGeminiKeyFromCloud(){
+    if(!fb || !fb.user) return;
+    try {
+      const { fs } = fb;
+      const ref = fs.doc(fb.db, 'users', fb.user.uid, 'config', 'main');
+      const snap = await fs.getDoc(ref);
+      if(snap.exists()){
+        const data = snap.data();
+        if(data.geminiKey){
+          state.apiKey = data.geminiKey;
+          localStorage.setItem('ss_api_key', data.geminiKey);
+        }
+      }
+    } catch(e){
+      console.warn('Failed to load Gemini key from cloud:', e);
+    }
+  }
+
+  async function saveGeminiKeyToCloud(key){
+    if(!fb || !fb.user) return;
+    try {
+      const { fs } = fb;
+      const ref = fs.doc(fb.db, 'users', fb.user.uid, 'config', 'main');
+      await fs.setDoc(ref, { geminiKey: key, updatedAt: Date.now() }, { merge: true });
+    } catch(e){
+      console.warn('Failed to save Gemini key to cloud:', e);
+    }
+  }
+
+  async function beginSyncForGoogleUser(){
+    if(!fb || !fb.user) return;
+    const { fs } = fb;
+    const uid = fb.user.uid;
+
+    try {
+      const mainRef = fs.doc(fb.db, 'users', uid, 'state', 'main');
+      const snap = await fs.getDoc(mainRef);
+      const localHasData = state.notebooks.length > 0 || state.results.length > 0;
+      const cloudHasData = snap.exists();
+
+      if(cloudHasData && !localHasData){
+        await pullFromFirebase();
+        toast('☁️ Synced from cloud');
+      } else if(cloudHasData && localHasData){
+        const cloudData = snap.data();
+        const cloudTime = cloudData.updatedAt || 0;
+        const localTime = Math.max(
+          ...state.notebooks.map(n => n.created || 0),
+          ...state.results.map(r => r.date || 0),
+          0
+        );
+        if(cloudTime > localTime){
+          await pullFromFirebase();
+          toast('☁️ Pulled newer cloud version');
+        } else {
+          await pushToFirebase();
+          toast('⬆️ Pushed newer local version');
+        }
+      } else if(localHasData){
+        await pushToFirebase();
+        toast('⬆️ Initial sync up');
+      }
+
+      // Real-time listener
+      const unsub = fs.onSnapshot(mainRef, (s) => {
+        if(fb && fb.suppressNext){ fb.suppressNext = false; return; }
+        if(!s.exists()) return;
+        const data = s.data();
+        if(state._lastPushTime && Math.abs((data.updatedAt || 0) - state._lastPushTime) < 2000) return;
+        pullDataIntoState(data).catch(e => console.error(e));
+      });
+      fb.listeners.push(unsub);
+
+      state.syncStatus = 'live';
+      render();
+    } catch(e){
+      console.error(e);
+      state.syncStatus = 'error';
+      state.syncError = e.message || 'Sync failed';
+      render();
+    }
+  }
+
   async function connectFirebase(cfg){
     state.syncStatus = 'connecting';
     state.syncError = '';
@@ -614,6 +862,8 @@
 
   async function pushToFirebase(){
     if(!fb) return;
+    const path = getSyncPath();
+    if(!path) return;
     const { fs } = fb;
     const now = Date.now();
     const mainData = {
@@ -624,7 +874,7 @@
     };
     state._lastPushTime = now;
     fb.suppressNext = true;
-    const mainRef = fs.doc(fb.db, 'users', fb.syncCode, 'state', 'main');
+    const mainRef = fs.doc(fb.db, 'users', path, 'state', 'main');
     await fs.setDoc(mainRef, mainData);
     // Push sources (heavy text). Only push ones we haven't pushed before in this session
     if(!state._pushedSources) state._pushedSources = new Set();
@@ -633,7 +883,7 @@
         const key = src.id + ':' + (src.chunks?.length || 0);
         if(state._pushedSources.has(key)) continue;
         try {
-          const srcRef = fs.doc(fb.db, 'users', fb.syncCode, 'sources', src.id);
+          const srcRef = fs.doc(fb.db, 'users', path, 'sources', src.id);
           await fs.setDoc(srcRef, { text: src.text || '', chunks: src.chunks || [] });
           state._pushedSources.add(key);
         } catch(e){
@@ -645,8 +895,10 @@
 
   async function pullFromFirebase(){
     if(!fb) return;
+    const path = getSyncPath();
+    if(!path) return;
     const { fs } = fb;
-    const mainRef = fs.doc(fb.db, 'users', fb.syncCode, 'state', 'main');
+    const mainRef = fs.doc(fb.db, 'users', path, 'state', 'main');
     const snap = await fs.getDoc(mainRef);
     if(!snap.exists()) return;
     await pullDataIntoState(snap.data());
@@ -654,8 +906,9 @@
 
   async function pullDataIntoState(data){
     if(!fb) return;
+    const path = getSyncPath();
+    if(!path) return;
     const { fs } = fb;
-    // Hydrate sources: for each source mentioned in shallow notebooks, fetch if we don't have it locally
     const localSourceMap = {};
     state.notebooks.forEach(nb => nb.sources.forEach(s => { localSourceMap[s.id] = s; }));
     const newNotebooks = [];
@@ -663,11 +916,10 @@
       const sources = [];
       for(const ssrc of (nb.sources || [])){
         if(localSourceMap[ssrc.id]){
-          // already have it
           sources.push({ ...ssrc, text: localSourceMap[ssrc.id].text, chunks: localSourceMap[ssrc.id].chunks });
         } else {
           try {
-            const sRef = fs.doc(fb.db, 'users', fb.syncCode, 'sources', ssrc.id);
+            const sRef = fs.doc(fb.db, 'users', path, 'sources', ssrc.id);
             const sSnap = await fs.getDoc(sRef);
             if(sSnap.exists()){
               const sd = sSnap.data();
@@ -773,8 +1025,16 @@
     reader.readAsText(file);
   }
 
-  // Auto-reconnect on load if config exists
-  if(state.syncConfig){
+  // Auto-init on load
+  if(configIsEmbedded()){
+    // Use Google auth flow
+    setTimeout(() => initGoogleAuth().catch(e => {
+      console.error('Auto-init failed:', e);
+      state.syncStatus = 'error';
+      state.syncError = e.message;
+    }), 100);
+  } else if(state.syncConfig){
+    // Fall back to manual sync code flow
     setTimeout(() => connectFirebase(state.syncConfig).catch(e => {
       console.error('Auto-sync failed:', e);
       state.syncStatus = 'error';
@@ -1293,24 +1553,41 @@ Return ONLY valid JSON. No markdown fences.`;
             ${hasKey?'Change key':'Add API key'}
           </button>
         </div>
-        <div class="api-status" style="margin-top:10px">
-          <div class="label">Cloud sync</div>
-          <div class="value" style="color:${state.syncStatus==='live'?'var(--lime)':state.syncStatus==='connecting'?'var(--sun)':state.syncStatus==='error'?'var(--pink)':'rgba(255,248,236,.5)'}">
-            ${state.syncStatus==='live'?'● Live':state.syncStatus==='connecting'?'◐ Connecting':state.syncStatus==='error'?'● Error':'○ Offline'}
+        ${state.googleUser ? `
+          <div class="api-status" style="margin-top:10px">
+            <div class="label">Signed in as</div>
+            <div style="display:flex;align-items:center;gap:8px;margin-top:4px">
+              ${state.googleUser.photoURL ? `<img src="${state.googleUser.photoURL}" style="width:24px;height:24px;border-radius:50%;border:2px solid var(--sun)" referrerpolicy="no-referrer"/>` : '<div style="width:24px;height:24px;border-radius:50%;background:var(--sun);color:var(--ink);display:flex;align-items:center;justify-content:center;font-weight:700;font-size:11px">' + (state.googleUser.email||'?')[0].toUpperCase() + '</div>'}
+              <div style="font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600">${state.googleUser.email}</div>
+            </div>
+            <div class="value" style="color:${state.syncStatus==='live'?'var(--lime)':state.syncStatus==='connecting'?'var(--sun)':'var(--pink)'};margin-top:6px;font-size:11px">
+              ${state.syncStatus==='live'?'☁️ Synced live':state.syncStatus==='connecting'?'◐ Syncing…':'⚠ Sync error'}
+            </div>
+            <button class="btn btn-ghost" style="margin-top:6px;padding:5px 10px;font-size:11px;color:#fff8ec;width:100%;justify-content:flex-start" data-action="export-data">⬇️ Export backup</button>
+            <button class="btn btn-ghost" style="margin-top:4px;padding:5px 10px;font-size:11px;color:#fff8ec;width:100%;justify-content:flex-start" data-action="import-data">⬆️ Import backup</button>
+            <button class="btn btn-ghost" style="margin-top:4px;padding:5px 10px;font-size:11px;color:#fff8ec;width:100%;justify-content:flex-start" data-action="lock-now">🔒 Lock app</button>
+            <button class="btn btn-ghost" style="margin-top:4px;padding:5px 10px;font-size:11px;color:#fff8ec;width:100%;justify-content:flex-start" data-action="sign-out-google">↪ Sign out</button>
           </div>
-          <button class="btn btn-ghost" style="margin-top:8px;padding:6px 10px;font-size:12px;color:#fff8ec;width:100%;justify-content:flex-start" data-action="open-sync">
-            ☁️ ${state.syncStatus==='live'?'Sync settings':'Setup sync'}
-          </button>
-          <button class="btn btn-ghost" style="margin-top:4px;padding:6px 10px;font-size:12px;color:#fff8ec;width:100%;justify-content:flex-start" data-action="export-data">
-            ⬇️ Export backup
-          </button>
-          <button class="btn btn-ghost" style="margin-top:4px;padding:6px 10px;font-size:12px;color:#fff8ec;width:100%;justify-content:flex-start" data-action="import-data">
-            ⬆️ Import backup
-          </button>
-          <button class="btn btn-ghost" style="margin-top:4px;padding:6px 10px;font-size:12px;color:#fff8ec;width:100%;justify-content:flex-start" data-action="lock-now">
-            🔒 Lock app
-          </button>
-        </div>
+        ` : `
+          <div class="api-status" style="margin-top:10px">
+            <div class="label">Cloud sync</div>
+            <div class="value" style="color:${state.syncStatus==='live'?'var(--lime)':state.syncStatus==='connecting'?'var(--sun)':state.syncStatus==='error'?'var(--pink)':'rgba(255,248,236,.5)'}">
+              ${state.syncStatus==='live'?'● Live':state.syncStatus==='connecting'?'◐ Connecting':state.syncStatus==='error'?'● Error':'○ Offline'}
+            </div>
+            <button class="btn btn-ghost" style="margin-top:8px;padding:6px 10px;font-size:12px;color:#fff8ec;width:100%;justify-content:flex-start" data-action="open-sync">
+              ☁️ ${state.syncStatus==='live'?'Sync settings':'Setup sync'}
+            </button>
+            <button class="btn btn-ghost" style="margin-top:4px;padding:6px 10px;font-size:12px;color:#fff8ec;width:100%;justify-content:flex-start" data-action="export-data">
+              ⬇️ Export backup
+            </button>
+            <button class="btn btn-ghost" style="margin-top:4px;padding:6px 10px;font-size:12px;color:#fff8ec;width:100%;justify-content:flex-start" data-action="import-data">
+              ⬆️ Import backup
+            </button>
+            <button class="btn btn-ghost" style="margin-top:4px;padding:6px 10px;font-size:12px;color:#fff8ec;width:100%;justify-content:flex-start" data-action="lock-now">
+              🔒 Lock app
+            </button>
+          </div>
+        `}
       </aside>`;
   }
 
@@ -2211,7 +2488,65 @@ service cloud.firestore {
   }
 
   // ===== Main render =====
+  function renderSignInScreen(){
+    const isUnauthorized = state.syncStatus === 'unauthorized';
+    const isError = state.syncStatus === 'error';
+    return `
+      <div style="display:flex;align-items:center;justify-content:center;min-height:100vh;width:100%;padding:20px;position:relative;z-index:1">
+        <div style="background:#fff;border:3px solid var(--ink);border-radius:24px;box-shadow:10px 10px 0 var(--ink);padding:40px 32px;max-width:440px;width:100%;text-align:center">
+          <div style="font-family:'Fraunces',serif;font-weight:900;font-size:42px;color:var(--ink);letter-spacing:-0.03em;margin-bottom:8px;display:flex;align-items:center;justify-content:center;gap:10px">
+            <span style="display:inline-block;width:18px;height:18px;border-radius:50%;background:var(--pink);box-shadow:4px 4px 0 var(--sun);transform:translateY(-6px)"></span>
+            StudySpark
+          </div>
+          <p style="color:rgba(26,21,48,.65);font-weight:500;margin-bottom:28px;font-size:15px">Your AI study notebooks, synced across devices</p>
+
+          ${isUnauthorized ? `
+            <div style="padding:14px;background:#ffe5e5;border:2px solid var(--pink);border-radius:12px;margin-bottom:18px;font-size:14px;font-weight:500;color:#a3104a">
+              🚫 ${state.syncError || 'This account is not authorized.'}
+            </div>
+          ` : ''}
+          ${isError ? `
+            <div style="padding:14px;background:#fff8ec;border:2px solid var(--ink);border-radius:12px;margin-bottom:18px;font-size:13px;font-weight:500">
+              ⚠️ ${state.syncError || 'Could not connect to Firebase. Check that the embedded config is correct.'}
+            </div>
+          ` : ''}
+
+          <button data-action="sign-in-google" style="width:100%;padding:14px 20px;border:3px solid var(--ink);border-radius:14px;background:#fff;font-weight:700;font-size:16px;cursor:pointer;box-shadow:3px 3px 0 var(--ink);display:flex;align-items:center;justify-content:center;gap:10px;font-family:inherit;transition:all .12s" ${state.signInPending?'disabled':''}>
+            <svg width="20" height="20" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+              <path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" fill="#4285F4"/>
+              <path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#34A853"/>
+              <path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" fill="#FBBC05"/>
+              <path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#EA4335"/>
+            </svg>
+            ${state.signInPending ? 'Signing in…' : 'Sign in with Google'}
+          </button>
+
+          <p style="font-size:12px;color:rgba(26,21,48,.5);margin-top:18px;line-height:1.5">
+            Only authorized accounts can access this app.<br>
+            Your data syncs across all your devices automatically.
+          </p>
+        </div>
+      </div>`;
+  }
+
   function render(){
+    // If embedded config + not signed in -> show sign-in screen
+    if(configIsEmbedded() && (state.syncStatus === 'signin-needed' || state.syncStatus === 'unauthorized' || (state.syncStatus === 'error' && !state.googleUser))){
+      root.innerHTML = renderSignInScreen() +
+        (state.toast ? `<div class="toast">${state.toast}</div>` : '');
+      attachHandlers();
+      return;
+    }
+    // If embedded config + still connecting on first load (no user yet) -> brief loader
+    if(configIsEmbedded() && state.syncStatus === 'connecting' && !state.googleUser){
+      root.innerHTML = `<div style="display:flex;align-items:center;justify-content:center;min-height:100vh;width:100%;position:relative;z-index:1">
+        <div style="text-align:center"><div class="loader-spinner" style="margin:0 auto 16px"></div>
+        <div style="font-family:'Fraunces',serif;font-size:18px;font-weight:700">Loading…</div></div>
+      </div>` + (state.toast ? `<div class="toast">${state.toast}</div>` : '');
+      attachHandlers();
+      return;
+    }
+
     let body;
     if(state.loading) body = renderLoader(state.loading.text, state.loading.sub);
     else if(state.currentQuiz && state.quizState && !state.quizState.finished) body = renderQuizPlayer();
@@ -2321,9 +2656,23 @@ service cloud.firestore {
         localStorage.setItem('ss_api_key', v);
         state.modal = null;
         toast(v ? '✓ API key saved' : 'Key cleared');
+        // Also push to cloud if signed in with Google
+        if(fb && fb.user && fb.googleUser){
+          saveGeminiKeyToCloud(v).then(() => {
+            if(v) toast('☁️ Synced to your other devices too');
+          });
+        }
         render();
         break;
       }
+      case 'sign-in-google':
+        signInWithGoogle();
+        break;
+      case 'sign-out-google':
+        if(confirm('Sign out? Your local data stays, but sync will stop.')){
+          signOutGoogle();
+        }
+        break;
       case 'lock-now':
         sessionStorage.removeItem('ss_unlocked');
         location.reload();
