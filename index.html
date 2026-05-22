@@ -398,7 +398,7 @@
     // Email allowlist - ONLY these emails can sign in.
     // Add yours (lowercase) and any family/team members you want to grant access.
     allowedEmails: [
-      'sawandobariya.uk@gmail.com',
+      'your-email@gmail.com',
     ],
   };
   // ===============================================================
@@ -440,9 +440,10 @@
     mobileTab: 'chat', // sources | chat | studio - which panel shows on mobile
     activeNotebook: null,
     selectedSources: null, // Set of source IDs selected for chat/study aids (null = all)
+    chapterFilter: null,   // { sourceId, chapterNum } to limit AI context to one chapter
     currentQuiz: null,
     quizState: null,
-    quizConfig: { count: 10, difficulty: 'medium', types: ['mcq'], focus: '' },
+    quizConfig: { count: 10, difficulty: 'medium', types: ['mcq'], focus: '', chapterFilter: null },
     currentFlashcards: null,
     flashState: null,
     currentMindmap: null,
@@ -1091,6 +1092,64 @@
     return cleaned.length > 0 ? cleaned : chunks; // never return empty
   }
 
+  // ===== Chapter detection =====
+  // Try to find chapter markers at the start of a chunk
+  function detectChapterStart(chunkText){
+    const head = chunkText.substring(0, 500);
+    const patterns = [
+      // "Chapter 1: Introduction to..." or "CHAPTER 1 - ..."
+      /(?:^|\n)\s*(CHAPTER|Chapter)\s+(\d+|[IVX]+)\b[\s:.\-—]*([A-Z][^\n.]{2,80})/,
+      // "1: Concept of audit" or "1. Concept of audit" at start of chunk
+      /(?:^|\n)\s*(\d{1,2})\s*[:.]\s+([A-Z][a-z][^\n.]{4,80})/,
+      // "Unit 3 — Audit Planning"
+      /(?:^|\n)\s*(UNIT|Unit|MODULE|Module|PART|Part|SECTION|Section)\s+(\d+|[IVX]+)\b[\s:.\-—]*([A-Z][^\n.]{2,80})/,
+    ];
+    for(const p of patterns){
+      const m = head.match(p);
+      if(m){
+        let num, title;
+        if(m[1] && /CHAPTER|Chapter|UNIT|Unit|MODULE|Module|PART|Part|SECTION|Section/.test(m[1])){
+          num = m[2];
+          title = m[3] ? m[3].trim() : '';
+        } else {
+          num = m[1];
+          title = m[2] ? m[2].trim() : '';
+        }
+        if(title.length > 80) title = title.substring(0, 80);
+        return { num: String(num), title: title || 'Untitled', label: `Ch ${num}${title ? ': ' + title : ''}` };
+      }
+    }
+    return null;
+  }
+
+  // Build a list of detected chapters for a source.
+  // Each: { num, title, label, startChunk, endChunk } - chunk indices are 0-based inclusive ranges.
+  function detectChapters(chunks){
+    const chapters = [];
+    let currentChapter = null;
+    chunks.forEach((chunk, i) => {
+      const found = detectChapterStart(chunk);
+      if(found){
+        if(currentChapter){
+          currentChapter.endChunk = i - 1;
+          chapters.push(currentChapter);
+        }
+        currentChapter = { ...found, startChunk: i, endChunk: i };
+      } else if(currentChapter){
+        currentChapter.endChunk = i;
+      }
+    });
+    if(currentChapter) chapters.push(currentChapter);
+    // Dedupe consecutive chapters with same number
+    const dedupe = [];
+    for(const ch of chapters){
+      const last = dedupe[dedupe.length - 1];
+      if(last && last.num === ch.num){ last.endChunk = ch.endChunk; }
+      else { dedupe.push(ch); }
+    }
+    return dedupe;
+  }
+
   // ===== PDF =====
   async function extractPDF(file){
     const buf = await file.arrayBuffer();
@@ -1245,43 +1304,58 @@
   }
 
   // ===== Build grounded context for a notebook (with citation tags) =====
-  function buildGroundedContext(notebook, selectedSourceIds = null, maxChars = 80000){
-    const sources = notebook.sources.filter(s => !selectedSourceIds || selectedSourceIds.has(s.id));
+  // chapterFilter: optional { sourceId, chapterNum } to limit context to a specific chapter
+  function buildGroundedContext(notebook, selectedSourceIds = null, maxChars = 80000, chapterFilter = null){
+    let sources = notebook.sources.filter(s => !selectedSourceIds || selectedSourceIds.has(s.id));
+
+    // Apply chapter filter: keep only the chunks within the selected chapter
+    if(chapterFilter && chapterFilter.sourceId && chapterFilter.chapterNum){
+      sources = sources.map(src => {
+        if(src.id !== chapterFilter.sourceId) return null;
+        const chapters = src.chapters || [];
+        const ch = chapters.find(c => c.num === chapterFilter.chapterNum);
+        if(!ch) return null;
+        // Slice chunks to chapter range
+        const chapterChunks = src.chunks.slice(ch.startChunk, ch.endChunk + 1);
+        return { ...src, chunks: chapterChunks, _chunkOffset: ch.startChunk };
+      }).filter(Boolean);
+      if(sources.length === 0) sources = notebook.sources.filter(s => !selectedSourceIds || selectedSourceIds.has(s.id));
+    }
+
     let totalChunks = 0;
     sources.forEach(s => totalChunks += s.chunks.length);
     const budget = Math.max(maxChars, 40000);
     const targetCharsPerChunk = Math.max(800, Math.floor(budget / Math.max(totalChunks, 1)));
     let out = '';
     sources.forEach((src) => {
-      const sNum = notebook.sources.indexOf(src) + 1;
+      const sNum = notebook.sources.indexOf(notebook.sources.find(x => x.id === src.id)) + 1;
+      const offset = src._chunkOffset || 0;
       out += `\n\n========== SOURCE ${sNum}: ${src.name} ==========\n`;
       src.chunks.forEach((chunk, cIdx) => {
+        const realIdx = cIdx + offset + 1;
         const trimmed = chunk.length > targetCharsPerChunk
           ? chunk.substring(0, targetCharsPerChunk) + '...'
           : chunk;
-        // Strong delimiters with cite-tag REPEATED at start and end so AI can anchor
-        out += `\n<<< [S${sNum}:${cIdx+1}] >>>\n${trimmed}\n<<< END [S${sNum}:${cIdx+1}] >>>\n`;
+        out += `\n<<< [S${sNum}:${realIdx}] >>>\n${trimmed}\n<<< END [S${sNum}:${realIdx}] >>>\n`;
       });
     });
-    // Hard truncate if too long: instead of sampling random characters (which breaks chunk boundaries),
-    // drop whole chunks from the middle of each source.
     if(out.length > maxChars){
-      // Rebuild with reduced chunks per source
       out = '';
       const chunksPerSource = Math.max(3, Math.floor(maxChars / (sources.length * 1500)));
       sources.forEach((src) => {
-        const sNum = notebook.sources.indexOf(src) + 1;
+        const sNum = notebook.sources.indexOf(notebook.sources.find(x => x.id === src.id)) + 1;
+        const offset = src._chunkOffset || 0;
         out += `\n\n========== SOURCE ${sNum}: ${src.name} ==========\n`;
-        // Take from start, middle, end
         const total = src.chunks.length;
         const indices = new Set();
         for(let i = 0; i < Math.min(chunksPerSource, total); i++){
           indices.add(Math.floor(i * total / chunksPerSource));
         }
         Array.from(indices).sort((a,b)=>a-b).forEach(cIdx => {
+          const realIdx = cIdx + offset + 1;
           const chunk = src.chunks[cIdx];
           const trimmed = chunk.length > 1200 ? chunk.substring(0, 1200) + '...' : chunk;
-          out += `\n<<< [S${sNum}:${cIdx+1}] >>>\n${trimmed}\n<<< END [S${sNum}:${cIdx+1}] >>>\n`;
+          out += `\n<<< [S${sNum}:${realIdx}] >>>\n${trimmed}\n<<< END [S${sNum}:${realIdx}] >>>\n`;
         });
       });
     }
@@ -1293,7 +1367,7 @@
     const sources = notebook.sources.filter(s => !state.selectedSources || state.selectedSources.has(s.id));
     if(sources.length === 0) throw new Error('Select at least one source.');
 
-    const context = buildGroundedContext(notebook, state.selectedSources);
+    const context = buildGroundedContext(notebook, state.selectedSources, 80000, state.chapterFilter);
     const history = state.chatHistory[notebook.id] || [];
     const recentHistory = history.slice(-6).map(m => `${m.role === 'user' ? 'USER' : 'ASSISTANT'}: ${m.content}`).join('\n\n');
 
@@ -1328,7 +1402,7 @@ Answer thoroughly. Cite every factual claim with the EXACT [S#:#] tag of the sup
   }
 
   async function suggestQuestions(notebook){
-    const context = buildGroundedContext(notebook, state.selectedSources, 40000);
+    const context = buildGroundedContext(notebook, state.selectedSources, 40000, state.chapterFilter);
     const prompt = `Based on these study sources, generate exactly 4 insightful exam-prep questions a student would ask. Mix question types: one conceptual ("explain X"), one comparison ("how does X differ from Y"), one application ("when would you use X"), one analysis ("why does X matter").
 
 Each question should be specific and substantive, drawn from the actual content. Avoid generic questions like "What is this about?".
@@ -1349,7 +1423,7 @@ Return ONLY valid JSON. No markdown fences, no preamble.`;
 
   // ===== Study aids =====
   async function generateSummary(notebook){
-    const context = buildGroundedContext(notebook, state.selectedSources);
+    const context = buildGroundedContext(notebook, state.selectedSources, 80000, state.chapterFilter);
     const prompt = `Create a polished briefing document from the sources. Output clean, readable markdown.
 
 CITATION RULES (CRITICAL):
@@ -1388,7 +1462,7 @@ Return only the markdown briefing.`;
   }
 
   async function generateStudyGuide(notebook){
-    const context = buildGroundedContext(notebook, state.selectedSources);
+    const context = buildGroundedContext(notebook, state.selectedSources, 80000, state.chapterFilter);
     const prompt = `Create a comprehensive, well-formatted study guide from these sources.
 
 CITATION RULES (CRITICAL):
@@ -1432,7 +1506,7 @@ Return only the markdown.`;
   }
 
   async function generateFAQ(notebook){
-    const context = buildGroundedContext(notebook, state.selectedSources);
+    const context = buildGroundedContext(notebook, state.selectedSources, 80000, state.chapterFilter);
     const prompt = `Generate 10-12 likely exam questions with detailed model answers from these sources.
 
 HOW TO CITE:
@@ -1458,7 +1532,7 @@ ${context}`;
 
   // ===== Quiz/Flashcards/Mindmap =====
   async function generateQuiz(notebook, cfg){
-    const context = buildGroundedContext(notebook, state.selectedSources, 60000);
+    const context = buildGroundedContext(notebook, state.selectedSources, 60000, state.chapterFilter);
     const typeStr = cfg.types.join(', ');
     const focusStr = cfg.focus ? `\nFOCUS / CUSTOMIZATION: ${cfg.focus}` : '';
     const prompt = `Generate ${cfg.count} ${cfg.difficulty}-difficulty quiz questions from these study sources.
@@ -1488,7 +1562,7 @@ Return ONLY JSON.`;
   }
 
   async function generateFlashcards(notebook){
-    const context = buildGroundedContext(notebook, state.selectedSources, 50000);
+    const context = buildGroundedContext(notebook, state.selectedSources, 50000, state.chapterFilter);
     const prompt = `Create 15 high-quality study flashcards from these sources.
 - Front: clear prompt/term (1 line)
 - Back: precise answer (1-3 sentences)
@@ -1505,7 +1579,7 @@ Return ONLY JSON.`;
   }
 
   async function generateMindmap(notebook){
-    const context = buildGroundedContext(notebook, state.selectedSources, 50000);
+    const context = buildGroundedContext(notebook, state.selectedSources, 50000, state.chapterFilter);
     const prompt = `Create a visual mindmap of the core concepts in these sources.
 
 REQUIREMENTS:
@@ -1676,9 +1750,22 @@ Return ONLY valid JSON. No markdown fences.`;
   }
 
   // ===== Notebook view (3-column NotebookLM-style) =====
+  function ensureChaptersDetected(notebook){
+    if(!notebook || !notebook.sources) return;
+    let changed = false;
+    notebook.sources.forEach(src => {
+      if(!src.chapters && src.chunks && src.chunks.length > 0){
+        src.chapters = detectChapters(src.chunks);
+        changed = true;
+      }
+    });
+    if(changed) save();
+  }
+
   function renderNotebook(){
     const nb = state.activeNotebook;
     if(!nb) return renderNotebookList();
+    ensureChaptersDetected(nb);
     const chat = state.chatHistory[nb.id] || [];
     const selectedCount = state.selectedSources ? state.selectedSources.size : nb.sources.length;
     const tab = state.mobileTab;
@@ -1720,21 +1807,46 @@ Return ONLY valid JSON. No markdown fences.`;
             ${nb.sources.map((src, i) => {
               const isSelected = !state.selectedSources || state.selectedSources.has(src.id);
               const ico = src.type === 'pdf' ? '📄' : src.type === 'link' ? '🔗' : '📝';
+              const chapters = src.chapters || [];
+              const hasFilter = state.chapterFilter && state.chapterFilter.sourceId === src.id;
               return `
                 <div class="source-item ${isSelected?'selected':''}" data-action="toggle-src" data-id="${src.id}">
                   <div class="src-ico">${ico}</div>
                   <div class="src-body">
                     <div class="src-title"><span class="source-num">S${i+1}</span>${src.name}</div>
-                    <div class="src-meta">${src.chunks.length} chunks · ${src.type}</div>
+                    <div class="src-meta">${src.chunks.length} chunks${chapters.length ? ` · ${chapters.length} chapters` : ''} · ${src.type}</div>
                   </div>
                   <div class="src-del" data-action="del-src" data-id="${src.id}" onclick="event.stopPropagation()">🗑️</div>
-                </div>`;
+                </div>
+                ${chapters.length > 1 && isSelected ? `
+                  <div style="margin:0 0 14px 6px;padding:10px 12px;background:#fff8ec;border:2px dashed var(--ink);border-radius:10px">
+                    <div style="font-size:10px;font-weight:700;letter-spacing:.08em;color:var(--pink);margin-bottom:8px">📑 FOCUS ON CHAPTER</div>
+                    <div style="display:flex;flex-wrap:wrap;gap:4px">
+                      <button class="chip ${!hasFilter ? 'active chip-sun' : ''}" data-action="set-chapter" data-src="${src.id}" data-num="" style="padding:4px 10px;font-size:11px;border-width:2px">All</button>
+                      ${chapters.map(ch => `
+                        <button class="chip ${hasFilter && state.chapterFilter.chapterNum===ch.num ? 'active chip-sun' : ''}" data-action="set-chapter" data-src="${src.id}" data-num="${ch.num}" style="padding:4px 10px;font-size:11px;border-width:2px" title="${escapeHTML(ch.label)}">Ch ${ch.num}</button>
+                      `).join('')}
+                    </div>
+                    ${hasFilter ? `<div style="font-size:11px;font-weight:500;color:var(--ink);margin-top:6px">📌 ${escapeHTML(chapters.find(c => c.num === state.chapterFilter.chapterNum)?.label || '')}</div>` : ''}
+                  </div>
+                ` : ''}
+              `;
             }).join('')}
           </div>
 
           <!-- Chat panel -->
           <div class="nb-panel chat-area ${tab==='chat'?'mobile-active':''}">
             <h3><span class="ico">💬</span> Chat <span style="font-size:13px;font-weight:500;color:rgba(26,21,48,.5)">${selectedCount}/${nb.sources.length} sources</span></h3>
+            ${state.chapterFilter ? (() => {
+              const filterSrc = nb.sources.find(s => s.id === state.chapterFilter.sourceId);
+              const filterCh = filterSrc?.chapters?.find(c => c.num === state.chapterFilter.chapterNum);
+              if(!filterCh) return '';
+              return `<div style="padding:8px 12px;background:var(--sun);border:2px solid var(--ink);border-radius:10px;margin-bottom:12px;display:flex;align-items:center;gap:8px;font-size:13px;font-weight:600">
+                <span>📌</span>
+                <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">Focused on: ${escapeHTML(filterCh.label)}</span>
+                <button class="btn btn-ghost" data-action="clear-chapter" style="padding:2px 8px;font-size:11px">✕ Clear</button>
+              </div>`;
+            })() : ''}
             <div class="chat-messages" id="chatMsgs">
               ${chat.length === 0 ? `
                 <div class="chat-empty">
@@ -1959,13 +2071,45 @@ Return ONLY valid JSON. No markdown fences.`;
   // ===== Quiz/Flashcards/Mindmap render (reused from previous) =====
   function renderQuizSetup(){
     const nb = state.activeNotebook;
+    ensureChaptersDetected(nb);
+    // Banner showing what the quiz will cover
+    let scopeBanner = '';
+    if(state.chapterFilter){
+      const filterSrc = nb.sources.find(s => s.id === state.chapterFilter.sourceId);
+      const filterCh = filterSrc?.chapters?.find(c => c.num === state.chapterFilter.chapterNum);
+      if(filterCh){
+        scopeBanner = `<div style="padding:14px 18px;background:var(--lime);border:3px solid var(--ink);border-radius:14px;margin-bottom:20px;display:flex;align-items:center;gap:10px;font-weight:600">
+          <span style="font-size:20px">📌</span>
+          <div style="flex:1">
+            <div style="font-size:13px;letter-spacing:.05em;color:var(--ink);opacity:.7">QUIZ WILL COVER</div>
+            <div style="font-size:15px">${escapeHTML(filterCh.label)}</div>
+          </div>
+          <button class="btn btn-ghost btn-sm" data-action="clear-chapter">Use full notebook</button>
+        </div>`;
+      }
+    } else {
+      // No chapter filter - check if there are chapters available
+      const allChapters = [];
+      nb.sources.forEach(src => (src.chapters || []).forEach(ch => allChapters.push({ src, ch })));
+      if(allChapters.length > 0){
+        scopeBanner = `<div style="padding:14px 18px;background:#fff;border:3px dashed var(--ink);border-radius:14px;margin-bottom:20px">
+          <div style="font-size:13px;letter-spacing:.05em;color:var(--ink);opacity:.7;margin-bottom:8px;font-weight:700">📚 QUIZ SCOPE: ENTIRE NOTEBOOK · TAP A CHAPTER TO NARROW</div>
+          <div style="display:flex;flex-wrap:wrap;gap:5px;max-height:88px;overflow-y:auto">
+            ${allChapters.slice(0, 30).map(({src, ch}) => `
+              <button class="chip" data-action="set-chapter" data-src="${src.id}" data-num="${ch.num}" style="padding:5px 11px;font-size:12px" title="${escapeHTML(ch.label)} (${src.name})">Ch ${ch.num}${ch.title ? ': ' + escapeHTML(ch.title.substring(0,28)) : ''}</button>
+            `).join('')}
+          </div>
+        </div>`;
+      }
+    }
     return `
       <div class="main">
         <div style="display:flex;align-items:center;gap:14px;margin-bottom:24px">
           <button class="btn btn-ghost" data-action="back-to-nb">← Back to ${nb.emoji} ${nb.title}</button>
         </div>
         <h1 class="page-title">Build your quiz 🎯</h1>
-        <p class="page-sub">From all selected sources in this notebook.</p>
+        <p class="page-sub">${state.chapterFilter ? 'Focused on a specific chapter.' : 'From all selected sources in this notebook.'}</p>
+        ${scopeBanner}
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:24px">
           <div class="card" style="box-shadow:var(--shadow-sm)">
             <h3 style="font-size:22px;margin-bottom:16px">Number of questions</h3>
@@ -2038,8 +2182,12 @@ Return ONLY valid JSON. No markdown fences.`;
           </div>
           <div class="quiz-actions">
             <button class="btn btn-ghost" data-action="quiz-prev" ${qs.idx===0?'disabled':''}>← Back</button>
-            ${!qs.showExp && isAnswered ? `<button class="btn btn-teal" data-action="quiz-check">Check ✓</button>` :
-              qs.showExp ? (qs.idx === q.questions.length-1 ? `<button class="btn btn-pink" data-action="quiz-finish">Finish 🎉</button>` : `<button class="btn btn-pink" data-action="quiz-next">Next →</button>`) :
+            ${qs.showExp ? (
+              qs.idx === q.questions.length-1
+                ? `<button class="btn btn-pink" data-action="quiz-finish">Finish 🎉</button>`
+                : `<button class="btn btn-pink" data-action="quiz-next">Next →</button>`
+            ) : cur.type === 'short' ? `<button class="btn btn-teal" data-action="quiz-check">Reveal answer ✓</button>` :
+              isAnswered ? `<button class="btn btn-teal" data-action="quiz-check">Check ✓</button>` :
               `<button class="btn btn-ghost" disabled>Pick answer</button>`}
           </div>
         </div>
@@ -2770,6 +2918,7 @@ service cloud.firestore {
         if(!nb) return;
         state.activeNotebook = nb;
         state.selectedSources = null;
+        state.chapterFilter = null;
         state.page = 'notebook';
         render();
         break;
@@ -2841,9 +2990,26 @@ service cloud.firestore {
         if(state.selectedSources.has(id)) state.selectedSources.delete(id);
         else state.selectedSources.add(id);
         if(state.selectedSources.size === state.activeNotebook.sources.length) state.selectedSources = null;
+        // If the chapter filter is on a source we just deselected, clear it
+        if(state.chapterFilter && state.selectedSources && !state.selectedSources.has(state.chapterFilter.sourceId)){
+          state.chapterFilter = null;
+        }
         render();
         break;
       }
+      case 'set-chapter': {
+        if(!data.num){
+          state.chapterFilter = null;
+        } else {
+          state.chapterFilter = { sourceId: data.src, chapterNum: data.num };
+        }
+        render();
+        break;
+      }
+      case 'clear-chapter':
+        state.chapterFilter = null;
+        render();
+        break;
       case 'del-src':
         if(confirm('Remove this source?')){
           state.activeNotebook.sources = state.activeNotebook.sources.filter(s => s.id !== data.id);
@@ -2971,13 +3137,15 @@ service cloud.firestore {
   // ===== Source-adding helpers =====
   function addSource(srcData){
     const text = srcData.text;
-    const chunks = chunkText(text, 1000);
+    const chunks = chunkText(text);
+    const chapters = detectChapters(chunks);
     const source = {
       id: 'src_' + Date.now() + '_' + Math.random().toString(36).slice(2,7),
       type: srcData.type,
       name: srcData.name,
       text,
       chunks,
+      chapters,
       added: Date.now(),
     };
     state.activeNotebook.sources.push(source);
@@ -2985,7 +3153,8 @@ service cloud.firestore {
     state.activeNotebook.studio = {};
     state.activeNotebook.suggestedQs = [];
     save();
-    toast(`✨ Added "${source.name}" (${chunks.length} chunks)`);
+    const chMsg = chapters.length > 0 ? ` · ${chapters.length} chapter${chapters.length===1?'':'s'} detected` : '';
+    toast(`✨ Added "${source.name}" (${chunks.length} chunks${chMsg})`);
   }
 
   async function addPDFSource(file){
